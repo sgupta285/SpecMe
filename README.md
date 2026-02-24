@@ -450,7 +450,7 @@ All tables have **Row Level Security (RLS)** enabled — users can only read/wri
 - [x] Electron shell (double-click to launch)
 - [x] Conversation thread with per-run message history
 
-### 🔲 Roadmap (YC-Leap Features)
+### 🔲 Roadmap
 - [ ] **RAG / Vector Memory** — replace full-file context with ChromaDB/LanceDB semantic search (enables enterprise-scale repos with 1000s of files)
 - [ ] **SSE Streaming** — stream `technical_rationale` word-by-word using Server-Sent Events
 - [ ] **Closed-Loop Feedback** — Supabase Realtime trigger: user submits bug report → AI diff appears in dashboard within 30 seconds
