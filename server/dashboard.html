@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SpecMe | Professional AI Architect</title>
+
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.47/diff2html.min.css"
+    />
+
+    <style>
+      :root {
+        --bg: #0d1117;
+        --sidebar: #161b22;
+        --border: #30363d;
+        --text: #c9d1d9;
+        --accent: #238636;
+        --accent-hover: #2ea043;
+        --danger: #f85149;
+        --info: #388bfd;
+      }
+      body {
+        margin: 0;
+        display: flex;
+        height: 100vh;
+        font-family: -apple-system, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        overflow: hidden;
+      }
+
+      #sidebar {
+        width: 320px;
+        background: var(--sidebar);
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+      }
+      .sidebar-header {
+        padding: 20px;
+        font-weight: bold;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .file-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 12px;
+      }
+      .file-item {
+        padding: 12px;
+        margin-bottom: 6px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 13px;
+        color: #8b949e;
+        transition: 0.2s;
+      }
+      .file-item:hover {
+        background: #21262d;
+        color: white;
+      }
+      .file-item.active {
+        background: #2ea0431a;
+        color: #3fb950;
+        border: 1px solid #2ea04366;
+      }
+      .sidebar-footer {
+        padding: 15px;
+        border-top: 1px solid var(--border);
+      }
+
+      #main {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #input-area {
+        padding: 25px;
+        border-bottom: 1px solid var(--border);
+        background: var(--bg);
+      }
+      textarea {
+        width: 100%;
+        height: 70px;
+        background: #010409;
+        color: white;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 15px;
+        resize: none;
+        font-size: 14px;
+        outline: none;
+      }
+      textarea:focus {
+        border-color: var(--info);
+      }
+
+      button {
+        border: none;
+        padding: 10px 24px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: bold;
+        transition: 0.2s;
+      }
+      .btn-primary {
+        background: var(--accent);
+        color: white;
+      }
+      .btn-secondary {
+        background: #21262d;
+        color: var(--text);
+        border: 1px solid var(--border);
+      }
+      button:disabled {
+        opacity: 0.5;
+      }
+
+      #viewer {
+        flex: 1;
+        padding: 40px;
+        overflow-y: auto;
+      }
+      .section-label {
+        font-size: 11px;
+        font-weight: bold;
+        color: #8b949e;
+        text-transform: uppercase;
+        margin-bottom: 12px;
+        display: block;
+      }
+      .card {
+        background: #161b22;
+        border: 1px solid var(--border);
+        padding: 20px;
+        border-radius: 8px;
+        margin-bottom: 25px;
+        line-height: 1.6;
+      }
+
+      .d2h-file-wrapper {
+        border: 1px solid var(--border) !important;
+        background: #010409 !important;
+        margin-bottom: 20px;
+        border-radius: 8px !important;
+      }
+      .d2h-file-header {
+        background: #161b22 !important;
+        color: white !important;
+        border-bottom: 1px solid var(--border) !important;
+      }
+      .d2h-code-line-ctn {
+        font-family: "SFMono-Regular", monospace !important;
+        font-size: 12px !important;
+      }
+
+      .risk-item {
+        border-left: 4px solid var(--danger);
+        background: #f851490d;
+        padding: 12px;
+        margin-bottom: 10px;
+        font-size: 14px;
+      }
+      .next-step {
+        background: #2386361a;
+        padding: 8px 12px;
+        border-radius: 6px;
+        display: inline-block;
+        margin: 0 8px 8px 0;
+        font-size: 13px;
+        color: #3fb950;
+        border: 1px solid #2ea04333;
+      }
+
+      #toast {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        background: var(--accent);
+        color: white;
+        padding: 12px 24px;
+        border-radius: 8px;
+        display: none;
+        z-index: 1000;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="sidebar">
+      <div class="sidebar-header">
+        <span>SpecMe v3.0</span>
+        <span style="color: #3fb950">●</span>
+      </div>
+      <div class="file-list" id="fileList">
+        <div
+          class="file-item active"
+          id="nav-report"
+          onclick="switchView('report')"
+        >
+          📋 Executive Report
+        </div>
+      </div>
+      <div class="sidebar-footer">
+        <button
+          class="btn-secondary"
+          style="width: 100%"
+          onclick="syncContext()"
+        >
+          🔄 Sync Project Knowledge
+        </button>
+      </div>
+    </div>
+
+    <div id="main">
+      <div id="input-area">
+        <textarea
+          id="prompt"
+          placeholder="Ask SpecMe to architect a feature or audit code..."
+        ></textarea>
+        <button id="analyze-btn" class="btn-primary" onclick="analyze()">
+          Execute Architect Mode
+        </button>
+      </div>
+
+      <div id="viewer">
+        <div id="report-view">
+          <span class="section-label">Executive Summary</span>
+          <h2 id="summary" style="margin-top: 0">Ready to analyze.</h2>
+
+          <span class="section-label">Technical Rationale</span>
+          <div class="card" id="rationale">Awaiting prompt...</div>
+
+          <span class="section-label">Critical Risks</span>
+          <div id="risks"></div>
+
+          <span class="section-label">Next Steps</span>
+          <div id="next-steps"></div>
+        </div>
+
+        <div id="code-view" style="display: none">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 20px;
+            "
+          >
+            <div>
+              <span class="section-label" id="file-path">FILE</span>
+              <h3 id="file-explanation" style="margin: 0; color: #8b949e"></h3>
+            </div>
+            <button id="apply-btn" class="btn-primary" onclick="applyChanges()">
+              Apply This Fix
+            </button>
+          </div>
+          <div id="diff-container"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.47/diff2html.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.47/diff2html-ui.min.js"></script>
+
+    <script>
+      let sessionData = null;
+      let currentFileIndex = null;
+      const API = "http://localhost:4000/api";
+
+      function showToast(msg) {
+        const t = document.getElementById("toast");
+        t.innerText = msg;
+        t.style.display = "block";
+        setTimeout(() => (t.style.display = "none"), 5000); // Increased duration for safety messages
+      }
+
+      async function syncContext() {
+        try {
+          const res = await fetch(`${API}/sync`, { method: "POST" });
+          if (res.ok) showToast("🧠 Knowledge Base Updated!");
+          else showToast("❌ Sync failed");
+        } catch (e) {
+          showToast("❌ Connection error during sync");
+        }
+      }
+
+      async function analyze() {
+        const btn = document.getElementById("analyze-btn");
+        btn.innerText = "Architecting...";
+        btn.disabled = true;
+
+        try {
+          const res = await fetch(`${API}/analyze`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: document.getElementById("prompt").value,
+            }),
+          });
+
+          const result = await res.json();
+
+          if (!result.success) {
+            alert(result.error || "Analyze failed");
+            return;
+          }
+
+          sessionData = result.data;
+          updateSidebar();
+          switchView("report");
+        } catch (e) {
+          alert("Connection Error! Is the server running on port 4000?");
+        } finally {
+          btn.innerText = "Execute Architect Mode";
+          btn.disabled = false;
+        }
+      }
+
+      function updateSidebar() {
+        const list = document.getElementById("fileList");
+        list.innerHTML = `<div class="file-item active" id="nav-report" onclick="switchView('report')">📋 Executive Report</div>`;
+
+        const files = (sessionData && sessionData.files_to_modify) || [];
+        files.forEach((file, i) => {
+          const name = (file.fileName || "").split("/").pop();
+          list.innerHTML += `<div class="file-item" id="nav-${i}" onclick="switchView(${i})">📄 ${name}</div>`;
+        });
+      }
+
+      function switchView(view) {
+        if (!sessionData) return;
+
+        document
+          .querySelectorAll(".file-item")
+          .forEach((el) => el.classList.remove("active"));
+
+        if (view === "report") {
+          currentFileIndex = null;
+          document.getElementById("nav-report").classList.add("active");
+          document.getElementById("report-view").style.display = "block";
+          document.getElementById("code-view").style.display = "none";
+
+          document.getElementById("summary").innerText =
+            sessionData.summary || "No summary provided";
+          document.getElementById("rationale").innerText =
+            sessionData.technical_rationale || "No technical rationale available.";
+          document.getElementById("risks").innerHTML = (sessionData.risks || [])
+            .map((r) => `<div class="risk-item">${r}</div>`)
+            .join("");
+          document.getElementById("next-steps").innerHTML = (
+            sessionData.next_steps || []
+          )
+            .map((s) => `<span class="next-step">${s}</span>`)
+            .join("");
+        } else {
+          currentFileIndex = view;
+          const nav = document.getElementById(`nav-${view}`);
+          if (nav) nav.classList.add("active");
+
+          document.getElementById("report-view").style.display = "none";
+          document.getElementById("code-view").style.display = "block";
+
+          const file = sessionData.files_to_modify[view];
+          document.getElementById("file-path").innerText = file.fileName || "unknown_path";
+          document.getElementById("file-explanation").innerText =
+            file.explanation || "Modified by AI";
+
+          const diffTarget = document.getElementById("diff-container");
+          const patch = file.diffPatch || "";
+
+          if (!patch.trim()) {
+            diffTarget.innerHTML = `<div class="card">No diff available. Applying this will overwrite the file.</div>`;
+            return;
+          }
+
+          const diffHtml = Diff2Html.html(patch, {
+            drawFileList: false,
+            matching: "lines",
+            outputFormat: "side-by-side",
+          });
+
+          diffTarget.innerHTML = diffHtml;
+        }
+      }
+
+      async function applyChanges() {
+        if (currentFileIndex === null) return;
+
+        const file = sessionData.files_to_modify[currentFileIndex];
+        const applyBtn = document.getElementById("apply-btn");
+        
+        applyBtn.disabled = true;
+        applyBtn.innerText = "Applying...";
+
+        try {
+          const res = await fetch(`${API}/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              fileName: file.fileName,
+              fullCode: file.fullCode,
+            }),
+          });
+
+          const result = await res.json();
+          
+          if (result.success) {
+            const branchMsg = result.branch ? ` (Branch: ${result.branch})` : "";
+            showToast(`✅ Successfully applied to ${file.fileName}${branchMsg}`);
+          } else {
+            showToast(`❌ Save failed: ${result.error}`);
+          }
+        } catch (e) {
+          showToast(`❌ Connection error during save`);
+        } finally {
+          applyBtn.disabled = false;
+          applyBtn.innerText = "Apply This Fix";
+        }
+      }
+    </script>
+  </body>
+</html>

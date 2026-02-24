@@ -1,0 +1,172 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+
+    --card: 240 10% 5.5%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 240 10% 5.5%;
+    --popover-foreground: 0 0% 98%;
+
+    --primary: 262 92% 60%; /* purple */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 5% 12%;
+    --secondary-foreground: 0 0% 85%;
+
+    --muted: 240 5% 15%;
+    --muted-foreground: 240 5% 55%;
+
+    --accent: 240 5% 15%;
+    --accent-foreground: 0 0% 98%;
+
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 240 5% 17%;
+    --input: 240 5% 17%;
+    --ring: 262 92% 60%;
+
+    --radius: 1rem;
+
+    --success: 142 71% 45%;
+    --warning: 38 92% 50%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+}
+
+@layer components {
+  /* ====== Background (grid + glow) ====== */
+  .app-shell {
+    @apply min-h-screen bg-background text-foreground;
+    background: radial-gradient(
+        700px 500px at 18% 12%,
+        rgba(168, 85, 247, 0.22),
+        transparent 60%
+      ),
+      radial-gradient(
+        600px 450px at 72% 22%,
+        rgba(99, 102, 241, 0.16),
+        transparent 62%
+      ),
+      radial-gradient(
+        700px 550px at 45% 85%,
+        rgba(168, 85, 247, 0.1),
+        transparent 60%
+      );
+  }
+
+  .grid-overlay {
+    position: relative;
+  }
+  .grid-overlay::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.1;
+    background-image: linear-gradient(
+        to right,
+        rgba(148, 163, 184, 0.18) 1px,
+        transparent 1px
+      ),
+      linear-gradient(to bottom, rgba(148, 163, 184, 0.18) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(
+      circle at 30% 20%,
+      rgba(0, 0, 0, 1),
+      rgba(0, 0, 0, 0) 62%
+    );
+  }
+
+  /* ====== Surfaces ====== */
+  .glass-card {
+    @apply bg-card/40 border border-border/70 rounded-3xl backdrop-blur-xl;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+      0 18px 60px rgba(0, 0, 0, 0.4);
+  }
+
+  .soft-card {
+    @apply bg-card/30 border border-border/70 rounded-2xl backdrop-blur-xl;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.03) inset,
+      0 12px 40px rgba(0, 0, 0, 0.35);
+  }
+
+  .hero-card {
+    @apply relative overflow-hidden rounded-[28px] border border-border/70 bg-card/30 backdrop-blur-xl;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+      0 24px 80px rgba(0, 0, 0, 0.45);
+  }
+  .hero-card::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    pointer-events: none;
+    background: radial-gradient(
+        900px 520px at 14% 25%,
+        rgba(168, 85, 247, 0.35),
+        transparent 60%
+      ),
+      radial-gradient(
+        900px 520px at 75% 25%,
+        rgba(99, 102, 241, 0.18),
+        transparent 58%
+      );
+    opacity: 0.9;
+  }
+
+  .dashed-panel {
+    @apply rounded-3xl border border-dashed border-border/70 bg-card/20 backdrop-blur-xl;
+  }
+
+  /* ====== Pills / badges ====== */
+  .chip {
+    @apply inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border border-border/60 bg-card/30;
+  }
+
+  /* ====== Status ====== */
+  .status-pill {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+  .status-queued {
+    @apply status-pill bg-muted text-muted-foreground;
+  }
+  .status-running {
+    @apply status-pill bg-primary/20 text-[hsl(var(--primary))];
+  }
+  .status-done {
+    @apply status-pill bg-[hsl(var(--success))]/20 text-[hsl(var(--success))];
+  }
+  .status-error {
+    @apply status-pill bg-destructive/20 text-destructive;
+  }
+
+  /* ====== Text helpers ====== */
+  .muted {
+    @apply text-muted-foreground;
+  }
+  .grad-text {
+    background: linear-gradient(
+      90deg,
+      rgba(168, 85, 247, 1),
+      rgba(99, 102, 241, 1)
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
