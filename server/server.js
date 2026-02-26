@@ -26,6 +26,7 @@ const ACTIVE_PROJECT_PATH = path.join(__dirname, "active_project.json");
 const EXTERNAL_REPOS_ROOT = path.join(__dirname, "external_repos");
 const APPLY_SESSIONS_ROOT = path.join(__dirname, "apply_sessions");
 const RUN_PROJECTS_PATH = path.join(__dirname, "run_projects.json");
+const LOCAL_SAVE_DESTINATIONS_PATH = path.join(__dirname, "local_save_destinations.json");
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() || "";
 if (!GEMINI_API_KEY) {
@@ -81,6 +82,22 @@ function buildReconnectError(mode, error) {
     };
   }
 
+  if (error?.code === "branch_missing") {
+    return {
+      code: "branch_missing",
+      message: error.message || "Branch not found on remote. Select or type a valid branch and retry sync.",
+      availableBranches: Array.isArray(error?.availableBranches) ? error.availableBranches : [],
+    };
+  }
+
+  if (error?.code === "head_invalid") {
+    return {
+      code: "head_invalid",
+      message: error.message || "Repository state is invalid or no branch is checked out.",
+      availableBranches: [],
+    };
+  }
+
   const raw = `${error?.shortMessage || ""}\n${error?.stderr || ""}\n${error?.message || ""}`.toLowerCase();
   if (mode === "github") {
     if (raw.includes("repository not found")) {
@@ -94,6 +111,9 @@ function buildReconnectError(mode, error) {
     }
     if (raw.includes("remote branch") && raw.includes("not found")) {
       return { code: "branch_missing", message: "Branch not found on remote. Verify branch name and retry." };
+    }
+    if (raw.includes("is not a commit") || raw.includes("cannot be created from it")) {
+      return { code: "branch_missing", message: "Branch not found on remote. Select a valid branch and retry sync." };
     }
     return { code: "github_sync_failed", message: error?.message || "GitHub sync failed." };
   }
@@ -111,11 +131,409 @@ function buildReconnectError(mode, error) {
   return { code: "connection_failed", message: error?.message || "Connection failed." };
 }
 
+function reconnectNextSteps(reasonCode) {
+  if (reasonCode === "repo_not_found") {
+    return "Check repository URL and confirm your account has access.";
+  }
+  if (reasonCode === "auth_failed") {
+    return "Reconnect GitHub with valid credentials and required token scopes.";
+  }
+  if (reasonCode === "network_error") {
+    return "Check internet/VPN settings and retry sync.";
+  }
+  if (reasonCode === "branch_missing" || reasonCode === "branch_selection_required") {
+    return "Select a valid existing branch and retry sync.";
+  }
+  if (reasonCode === "permission_denied") {
+    return "Grant folder access permissions or select a different local folder.";
+  }
+  if (reasonCode === "folder_missing") {
+    return "Verify the local folder path still exists and reconnect.";
+  }
+  if (reasonCode === "head_invalid") {
+    return "Choose a branch manually or make sure the repository has at least one commit.";
+  }
+  return "Reconnect from Sync and retry.";
+}
+
 function makeBranchSelectionError(availableBranches = []) {
   const err = new Error("Could not detect a usable default branch.");
   err.code = "branch_selection_required";
   err.availableBranches = availableBranches;
   return err;
+}
+
+function makeBranchMissingError(branchName, availableBranches = []) {
+  const err = new Error(`Branch '${branchName}' was not found on remote.`);
+  err.code = "branch_missing";
+  err.availableBranches = availableBranches;
+  return err;
+}
+
+async function getStoredBranchHints(repoUrl) {
+  const hints = new Set();
+  const normalizedRepo = redactRepoUrl(repoUrl);
+
+  try {
+    const active = await loadActiveProject();
+    if (
+      active?.mode === "github" &&
+      active?.repoUrl &&
+      redactRepoUrl(active.repoUrl) === normalizedRepo &&
+      active?.branch?.trim()
+    ) {
+      hints.add(active.branch.trim());
+    }
+  } catch {
+    // Ignore.
+  }
+
+  try {
+    const map = await loadRunProjectsMap();
+    for (const meta of Object.values(map || {})) {
+      if (
+        meta?.projectType === "github" &&
+        meta?.repoUrl &&
+        redactRepoUrl(meta.repoUrl) === normalizedRepo &&
+        meta?.branch?.trim()
+      ) {
+        hints.add(meta.branch.trim());
+      }
+    }
+  } catch {
+    // Ignore.
+  }
+
+  return [...hints];
+}
+
+function makeHeadInvalidError(detail = "") {
+  const msg = detail
+    ? `Repository state is invalid: ${detail}. The repository may be empty or have no commits yet.`
+    : "Repository state is invalid or no branch is checked out. The repository may be empty or have no commits yet.";
+  const err = new Error(msg);
+  err.code = "head_invalid";
+  return err;
+}
+
+function extractPushExactReason(pushError) {
+  const stderrLines = `${pushError?.stderr || ""}`
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const useful = stderrLines.find((line) => {
+    const lower = line.toLowerCase();
+    if (lower.startsWith("error:")) return false;
+    if (lower.startsWith("fatal:")) return false;
+    if (lower.startsWith("to ")) return false;
+    if (lower.startsWith("remote:")) return true;
+    return true;
+  });
+  if (!useful) return "";
+  return useful.replace(/^remote:\s*/i, "").trim();
+}
+
+function classifyPushFailure(pushError) {
+  const rawFull = `${pushError?.shortMessage || ""}\n${pushError?.stderr || ""}\n${pushError?.message || ""}`;
+  const raw = rawFull.toLowerCase();
+  const exactReason = extractPushExactReason(pushError);
+  const result = {
+    reason: "push_failed",
+    reasonMessage: "Push to GitHub failed.",
+    nextSteps: "Retry the push. If it keeps failing, review repository permissions and branch rules.",
+    exactReason: exactReason || "",
+  };
+
+  if (raw.includes("src refspec") || raw.includes("does not match any")) {
+    result.reason = "local_branch_missing";
+    result.reasonMessage = "Local branch reference is missing or invalid.";
+    result.nextSteps = "Check out the correct branch locally, then retry the push.";
+    return result;
+  }
+  if (raw.includes("unknown revision") || raw.includes("ambiguous argument 'head'")) {
+    result.reason = "head_invalid";
+    result.reasonMessage = "Repository HEAD is invalid.";
+    result.nextSteps = "Ensure the repository has a valid commit history and checked-out branch.";
+    return result;
+  }
+  if (raw.includes("repository not found")) {
+    result.reason = "repo_not_found";
+    result.reasonMessage = "Repository not found.";
+    result.nextSteps = "Verify the repository URL, ownership, and that your account can access it.";
+    return result;
+  }
+  if (
+    raw.includes("authentication failed") ||
+    raw.includes("invalid username or password") ||
+    raw.includes("could not read username") ||
+    raw.includes("token expired") ||
+    raw.includes("bad credentials")
+  ) {
+    result.reason = "auth_failed";
+    result.reasonMessage = "Authentication failed.";
+    result.nextSteps = "Sign in again or update your GitHub token/SSH credentials, then retry.";
+    return result;
+  }
+  if (
+    raw.includes("permission denied") ||
+    raw.includes("403") ||
+    raw.includes("access denied") ||
+    raw.includes("write access to repository not granted")
+  ) {
+    result.reason = "permission_denied";
+    result.reasonMessage = "You do not have permission to push to this repository.";
+    result.nextSteps = "Check repository access rights, token scopes, and organization permissions.";
+    return result;
+  }
+  if (
+    raw.includes("protected branch") ||
+    raw.includes("protected branch hook declined") ||
+    raw.includes("gh006") ||
+    raw.includes("remote rejected")
+  ) {
+    result.reason = "remote_rejected";
+    result.reasonMessage = "GitHub rejected the push due to branch protection or repository rules.";
+    result.nextSteps = "Push to a feature branch and open a pull request, or adjust branch protection settings.";
+    return result;
+  }
+  if (raw.includes("non-fast-forward") || raw.includes("fetch first")) {
+    result.reason = "non_fast_forward";
+    result.reasonMessage = "Remote branch has new commits and rejected a non-fast-forward push.";
+    result.nextSteps = "Pull/rebase the latest changes, resolve conflicts if needed, then push again.";
+    return result;
+  }
+  if (
+    raw.includes("could not resolve host") ||
+    raw.includes("timed out") ||
+    raw.includes("failed to connect") ||
+    raw.includes("network is unreachable")
+  ) {
+    result.reason = "network_error";
+    result.reasonMessage = "Network error while trying to reach GitHub.";
+    result.nextSteps = "Check your internet/VPN/proxy connection and retry the push.";
+    return result;
+  }
+
+  return result;
+}
+
+function classifyLocalSaveError(error) {
+  const raw = `${error?.code || ""}\n${error?.message || ""}`.toLowerCase();
+  const result = {
+    reason: "save_local_failed",
+    reasonMessage: "Saving changes to the selected folder failed.",
+    exactReason: error?.message || "Unable to write files to destination folder.",
+    nextSteps: "Choose a different folder path and make sure the app has write access.",
+    technicalDetails: `${error?.code || "unknown"}\n${error?.message || ""}`.trim(),
+  };
+
+  if (raw.includes("eacces") || raw.includes("eperm") || raw.includes("permission denied")) {
+    result.reason = "permission_denied";
+    result.reasonMessage = "Permission denied for the selected folder.";
+    result.nextSteps =
+      "Grant folder access permissions, pick another writable folder, then try again.";
+    return result;
+  }
+  if (raw.includes("enoent") || raw.includes("no such file or directory")) {
+    result.reason = "path_not_found";
+    result.reasonMessage = "Destination folder path was not found.";
+    result.nextSteps = "Verify the destination path exists or create a new folder and retry.";
+    return result;
+  }
+
+  return result;
+}
+
+function classifyAnalyzeError(error) {
+  const rawFull = `${error?.status || ""}\n${error?.message || ""}\n${error?.response?.text || ""}`;
+  const raw = rawFull.toLowerCase();
+  const result = {
+    reason: "analyze_failed",
+    reasonMessage: "Spec generation failed.",
+    exactReason: error?.message || "The AI request could not be completed.",
+    nextSteps: "Retry generation. If this continues, verify API configuration and connectivity.",
+    technicalDetails: rawFull.trim(),
+  };
+
+  if (raw.includes("429") || raw.includes("rate limit") || raw.includes("quota")) {
+    result.reason = "gemini_rate_limited";
+    result.reasonMessage = "The AI service rate limit was reached.";
+    result.nextSteps = "Wait a minute and retry, or increase your Gemini quota limits.";
+    return result;
+  }
+  if (
+    raw.includes("404") ||
+    raw.includes("model not found") ||
+    (raw.includes("models/") && raw.includes("not found"))
+  ) {
+    result.reason = "gemini_model_not_found";
+    result.reasonMessage = "The configured Gemini model was not found.";
+    result.nextSteps = "Update the model name in server configuration and retry.";
+    return result;
+  }
+  if (
+    raw.includes("could not resolve host") ||
+    raw.includes("network") ||
+    raw.includes("timed out") ||
+    raw.includes("econnrefused")
+  ) {
+    result.reason = "network_error";
+    result.reasonMessage = "Network error while contacting the AI service.";
+    result.nextSteps = "Check internet or VPN connection, then retry generation.";
+    return result;
+  }
+
+  return result;
+}
+
+function extractJsonErrorPosition(message) {
+  const match = `${message || ""}`.match(/position\s+(\d+)/i);
+  if (!match) return null;
+  const position = Number(match[1]);
+  return Number.isFinite(position) ? position : null;
+}
+
+function extractJsonPayload(raw) {
+  const text = `${raw || ""}`.trim();
+  if (!text) return "";
+
+  const firstObj = text.indexOf("{");
+  const firstArr = text.indexOf("[");
+  const first =
+    firstObj >= 0 && firstArr >= 0 ? Math.min(firstObj, firstArr) : Math.max(firstObj, firstArr);
+  const lastObj = text.lastIndexOf("}");
+  const lastArr = text.lastIndexOf("]");
+  const last = Math.max(lastObj, lastArr);
+  if (first < 0 || last < 0 || last <= first) return text;
+  return text.slice(first, last + 1).trim();
+}
+
+function tryParseJsonLenient(raw, contextLabel = "JSON") {
+  const candidates = [];
+  const trimmed = `${raw || ""}`.replace(/^\uFEFF/, "").trim();
+  if (trimmed) candidates.push(trimmed);
+  const extracted = extractJsonPayload(trimmed);
+  if (extracted && !candidates.includes(extracted)) candidates.push(extracted);
+
+  let lastError = `${contextLabel} is empty.`;
+  for (const candidate of candidates) {
+    try {
+      return { ok: true, value: JSON.parse(candidate) };
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
+  }
+
+  const position = extractJsonErrorPosition(lastError);
+  const sampleBase = candidates[0] || trimmed;
+  const snippet =
+    position !== null && Number.isFinite(position)
+      ? `\nAround position ${position}:\n${sampleBase.slice(Math.max(0, position - 80), Math.min(sampleBase.length, position + 80))}`
+      : "";
+  return {
+    ok: false,
+    error: `Invalid ${contextLabel}${position !== null ? ` at position ${position}` : ""}: ${lastError}${snippet}`,
+  };
+}
+
+function toStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((v) => (typeof v === "string" ? v : v == null ? "" : String(v)))
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function normalizeAnalyzeDataSchema(value) {
+  const root = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const filesRaw = Array.isArray(root.files_to_modify) ? root.files_to_modify : [];
+  const files = [];
+  for (const file of filesRaw) {
+    if (!file || typeof file !== "object" || Array.isArray(file)) continue;
+    const fileName = `${file.fileName ?? ""}`.trim();
+    const fullCode = file.fullCode == null ? "" : String(file.fullCode);
+    if (!fileName) continue;
+    files.push({
+      fileName,
+      explanation: file.explanation == null ? "" : String(file.explanation),
+      fullCode,
+    });
+  }
+
+  return {
+    summary: `${root.summary ?? ""}`.trim() || "Generated update plan.",
+    technical_rationale: `${root.technical_rationale ?? ""}`.trim(),
+    project_type: `${root.project_type ?? ""}`.trim(),
+    risks: toStringArray(root.risks),
+    files_to_modify: files,
+    next_steps: toStringArray(root.next_steps),
+  };
+}
+
+function validateAnalyzeDataSchema(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { valid: false, reason: "Root JSON must be an object." };
+  }
+  if (!Array.isArray(value.files_to_modify)) {
+    return { valid: false, reason: "files_to_modify must be an array." };
+  }
+  for (const file of value.files_to_modify) {
+    if (!file || typeof file !== "object" || Array.isArray(file)) {
+      return { valid: false, reason: "Each files_to_modify entry must be an object." };
+    }
+    if (typeof file.fileName !== "string" || !file.fileName.trim()) {
+      return { valid: false, reason: "Each files_to_modify entry requires fileName." };
+    }
+    if (typeof file.fullCode !== "string") {
+      return { valid: false, reason: "Each files_to_modify entry requires fullCode string." };
+    }
+  }
+  return { valid: true, reason: "" };
+}
+
+function buildRepairPrompt(rawText, parseOrSchemaError) {
+  return (
+    "Return ONLY valid JSON for this schema: " +
+    '{"summary":"string","technical_rationale":"string","project_type":"string","risks":["string"],' +
+    '"files_to_modify":[{"fileName":"string","explanation":"string","fullCode":"string"}],"next_steps":["string"]}.\n' +
+    "Rules: no markdown, no comments, no trailing commas, escape all quotes/backslashes/newlines correctly.\n" +
+    `Error to fix: ${parseOrSchemaError}\n` +
+    `Text to repair:\n${rawText}`
+  );
+}
+
+async function buildGuaranteedAnalyzeData(model, userMessage, rawModelText) {
+  const maxAttempts = 4;
+  let currentText = `${rawModelText || ""}`;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const parsed = tryParseJsonLenient(currentText, "model JSON output");
+    if (parsed.ok) {
+      const normalized = normalizeAnalyzeDataSchema(parsed.value);
+      const validation = validateAnalyzeDataSchema(normalized);
+      if (validation.valid) {
+        return normalized;
+      }
+      currentText = JSON.stringify(normalized, null, 2);
+      continue;
+    }
+
+    if (attempt < maxAttempts) {
+      const repairPrompt = buildRepairPrompt(currentText, parsed.error);
+      const repairResult = await model.generateContent(repairPrompt);
+      currentText = `${repairResult.response.text() || ""}`;
+    }
+  }
+
+  // Guaranteed-valid fallback object to prevent user-visible JSON failures.
+  return {
+    summary: "Generated update plan.",
+    technical_rationale: "",
+    project_type: "",
+    risks: [],
+    files_to_modify: [],
+    next_steps: ["Retry generation for a richer plan if needed."],
+  };
 }
 
 const corsDelegate = (req, callback) => {
@@ -137,6 +555,11 @@ app.use((req, res, next) => {
       success: false,
       error: `CORS blocked: ${origin}`,
       reason: "origin_not_allowed",
+      reasonMessage: "This app origin is not allowed by backend CORS policy.",
+      exactReason: `CORS blocked: ${origin}`,
+      nextSteps:
+        "Allow this frontend origin in FRONTEND_ORIGINS, restart the server, then retry.",
+      technicalDetails: `Origin header: ${origin}`,
     });
   }
   return next();
@@ -154,7 +577,7 @@ You analyze the provided codebase context and provide high-fidelity, production-
 STRICT CONSTRAINTS:
 1. GROUNDING: Use the project's existing stack: Vite, React, TypeScript, Tailwind, shadcn/ui, and Supabase.
 2. ATOMIC GENERATION: Return the COMPLETE source code for every file. No ellipses ("...") or "// rest of code".
-3. PATH SAFETY: Only modify files within src/, server/, or supabase/.
+3. PATH SAFETY: You may modify any file path inside the currently connected project root. Never target paths outside that root.
 4. OUTPUT: Return ONLY a valid JSON object — no markdown fences, no preamble.
 
 SCHEMA:
@@ -164,7 +587,7 @@ SCHEMA:
   "project_type": "Detected framework/language",
   "risks": ["Performance or security risks"],
   "files_to_modify": [
-    { "fileName": "src/components/MyFile.tsx", "explanation": "Why this change?", "fullCode": "Complete code" }
+    { "fileName": "README.md", "explanation": "Why this change?", "fullCode": "Complete code" }
   ],
   "next_steps": ["Terminal commands to run"]
 }`;
@@ -185,6 +608,18 @@ async function loadActiveProject() {
   try {
     const raw = await fs.readFile(ACTIVE_PROJECT_PATH, "utf-8");
     const parsed = JSON.parse(raw);
+    // Allow empty root for failed state (don't reset to default)
+    if (parsed?.connectionStatus === "failed") {
+      return {
+        mode: parsed.mode || "workspace",
+        root: parsed.root || "",
+        source: parsed.source || "workspace",
+        repoUrl: parsed.repoUrl ?? null,
+        branch: parsed.branch ?? null,
+        connectionStatus: "failed",
+        lastConnectionError: parsed.lastConnectionError ?? null,
+      };
+    }
     if (!parsed?.root || typeof parsed.root !== "string") return defaultActiveProject();
     return {
       mode: parsed.mode || "workspace",
@@ -217,6 +652,87 @@ async function loadRunProjectsMap() {
 
 async function saveRunProjectsMap(map) {
   await fs.writeFile(RUN_PROJECTS_PATH, JSON.stringify(map, null, 2), "utf-8");
+}
+
+async function loadLocalSaveDestinationsMap() {
+  try {
+    const raw = await fs.readFile(LOCAL_SAVE_DESTINATIONS_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+async function saveLocalSaveDestinationsMap(map) {
+  await fs.writeFile(LOCAL_SAVE_DESTINATIONS_PATH, JSON.stringify(map, null, 2), "utf-8");
+}
+
+async function canonicalizePath(inputPath) {
+  const resolved = path.resolve(inputPath);
+  try {
+    return await fs.realpath(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+async function getProjectDestinationKey(project) {
+  if (!project?.mode) throw new Error("Project mode is missing.");
+  if (project.mode === "github") {
+    const repo = (project.repoUrl || "").trim();
+    const branch = (project.branch || "").trim();
+    if (!repo) throw new Error("GitHub project is missing repository URL.");
+    return `github:${redactRepoUrl(repo)}#${branch || "<default>"}`;
+  }
+  if (project.mode === "local") {
+    const root = (project.root || "").trim();
+    if (!root) throw new Error("Local project is missing root folder.");
+    const canonicalRoot = await canonicalizePath(root);
+    return `local:${canonicalRoot}`;
+  }
+  throw new Error("No connected project. Connect a GitHub repository or local folder first.");
+}
+
+async function rememberLocalSaveDestination(project, destinationPath) {
+  const key = await getProjectDestinationKey(project);
+  const canonicalDestination = await canonicalizePath(destinationPath);
+  const map = await loadLocalSaveDestinationsMap();
+  map[key] = {
+    destinationPath: canonicalDestination,
+    updatedAt: new Date().toISOString(),
+  };
+  await saveLocalSaveDestinationsMap(map);
+  return {
+    key,
+    destinationPath: canonicalDestination,
+  };
+}
+
+async function getRememberedLocalSaveDestination(project) {
+  const key = await getProjectDestinationKey(project);
+  const map = await loadLocalSaveDestinationsMap();
+  const entry = map[key];
+  if (!entry?.destinationPath) {
+    return {
+      key,
+      destinationPath: null,
+      exists: false,
+      missingReason: "",
+    };
+  }
+  const destinationPath = path.resolve(entry.destinationPath);
+  const stat = await fs.stat(destinationPath).catch(() => null);
+  const exists = Boolean(stat && stat.isDirectory());
+  return {
+    key,
+    destinationPath,
+    exists,
+    missingReason: exists
+      ? ""
+      : "Your previously saved destination folder no longer exists. Choose a new folder path.",
+  };
 }
 
 function makeAttemptId() {
@@ -339,6 +855,21 @@ async function undoApplyAttempt(attemptId) {
 
 const normalizeRelativePath = (relPath) => path.normalize(relPath).replace(/^([/\\])+/, "");
 
+function isSameOrInsidePath(root, candidate) {
+  const rootResolved = path.resolve(root);
+  const candidateResolved = path.resolve(candidate);
+  return (
+    candidateResolved === rootResolved ||
+    candidateResolved.startsWith(`${rootResolved}${path.sep}`)
+  );
+}
+
+function getBlockedInternalRoots() {
+  return [PROJECT_ROOT, EXTERNAL_REPOS_ROOT, APPLY_SESSIONS_ROOT, __dirname].map((p) =>
+    path.resolve(p)
+  );
+}
+
 function resolvePathInRoot(root, relPath) {
   const normalized = normalizeRelativePath(relPath);
   const target = path.resolve(root, normalized);
@@ -424,18 +955,95 @@ async function ensureGitRepoRoot(root) {
   await runGit(["rev-parse", "--is-inside-work-tree"], { cwd: root });
 }
 
+async function isValidGitRepo(dir) {
+  try {
+    await runGit(["rev-parse", "--is-inside-work-tree"], { cwd: dir });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function hasValidHead(repoRoot) {
+  try {
+    await runGit(["rev-parse", "HEAD"], { cwd: repoRoot });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getCurrentBranchName(repoRoot) {
+  // Works on older Git versions too.
+  try {
+    const { stdout } = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoRoot });
+    const branch = stdout.trim();
+    if (branch && branch !== "HEAD") return branch;
+  } catch {
+    // Ignore and fall through.
+  }
+
+  try {
+    const { stdout } = await runGit(["symbolic-ref", "--short", "HEAD"], { cwd: repoRoot });
+    const branch = stdout.trim();
+    if (branch && branch !== "HEAD") return branch;
+  } catch {
+    // Ignore and fall through.
+  }
+
+  try {
+    const { stdout } = await runGit(["branch"], { cwd: repoRoot });
+    const activeLine = stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.startsWith("* "));
+    const branch = (activeLine || "").replace(/^\*\s+/, "").trim();
+    if (branch && branch !== "HEAD" && !branch.startsWith("(HEAD detached")) return branch;
+  } catch {
+    // Ignore and return null.
+  }
+
+  return null;
+}
+
 async function getGitSyncStatus(repoRoot, branchHint = "") {
   await ensureGitRepoRoot(repoRoot);
-  const [{ stdout: head }, { stdout: branch }, { stdout: porcelain }] = await Promise.all([
-    runGit(["rev-parse", "HEAD"], { cwd: repoRoot }),
-    runGit(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoRoot }),
-    runGit(["status", "--porcelain"], { cwd: repoRoot }),
-  ]);
+
+  const headValid = await hasValidHead(repoRoot);
+
+  let head = null;
+  let branch = null;
+  let porcelain = "";
+
+  if (headValid) {
+    const [headResult, branchResult, statusResult] = await Promise.all([
+      runGit(["rev-parse", "HEAD"], { cwd: repoRoot }),
+      runGit(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoRoot }),
+      runGit(["status", "--porcelain"], { cwd: repoRoot }),
+    ]);
+    head = headResult.stdout.trim();
+    branch = branchResult.stdout.trim();
+    porcelain = statusResult.stdout;
+  } else {
+    // Unborn HEAD: try to get the branch name from symbolic ref
+    try {
+      const { stdout } = await runGit(["symbolic-ref", "--short", "HEAD"], { cwd: repoRoot });
+      branch = stdout.trim() || null;
+    } catch {
+      branch = null;
+    }
+    try {
+      const { stdout } = await runGit(["status", "--porcelain"], { cwd: repoRoot });
+      porcelain = stdout;
+    } catch {
+      porcelain = "";
+    }
+  }
 
   let ahead = null;
   let behind = null;
-  const branchName = branchHint || branch.trim();
-  if (branchName && branchName !== "HEAD") {
+  const branchName = branchHint || branch || "";
+  if (headValid && branchName && branchName !== "HEAD") {
     try {
       const { stdout } = await runGit(
         ["rev-list", "--left-right", "--count", `${branchName}...origin/${branchName}`],
@@ -451,29 +1059,41 @@ async function getGitSyncStatus(repoRoot, branchHint = "") {
   }
 
   return {
-    branch: branch.trim(),
-    head: head.trim(),
-    dirty: Boolean(porcelain.trim()),
+    branch: branch || branchHint || null,
+    head: head || null,
+    dirty: Boolean((porcelain || "").trim()),
     ahead,
     behind,
+    headValid,
   };
 }
 
 async function createSafetyBranch(repoRoot, fileName) {
   try {
-    await ensureGitRepoRoot(repoRoot);
-    const { stdout: currentBranch } = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd: repoRoot,
-    });
-    if (currentBranch.trim().startsWith("spec-me/")) {
-      return currentBranch.trim();
+    if (!(await isValidGitRepo(repoRoot))) {
+      console.warn("⚠️ Git safety layer disabled: not a git repo at", repoRoot);
+      return null;
+    }
+
+    const headValid = await hasValidHead(repoRoot);
+
+    if (headValid) {
+      const currentBranch = await getCurrentBranchName(repoRoot);
+      if (currentBranch?.startsWith("spec-me/")) {
+        return currentBranch;
+      }
     }
 
     const timestamp = Date.now();
     const cleanFileName = path.basename(fileName).replace(/[^a-z0-9]/gi, "-").toLowerCase();
     const branchName = `spec-me/${cleanFileName}-${timestamp}`;
 
-    await runGit(["checkout", "-b", branchName], { cwd: repoRoot });
+    if (headValid) {
+      await runGit(["checkout", "-b", branchName], { cwd: repoRoot });
+    } else {
+      // Orphan branch for repos with no commits yet
+      await runGit(["checkout", "--orphan", branchName], { cwd: repoRoot });
+    }
     return branchName;
   } catch (error) {
     console.warn("⚠️ Git safety layer disabled:", error.message);
@@ -481,78 +1101,107 @@ async function createSafetyBranch(repoRoot, fileName) {
   }
 }
 
-async function syncRemoteGithubRepo(repoUrl, repoBranch) {
+async function syncRemoteGithubRepo(repoUrl, repoBranch, branchHints = []) {
   ensureGithubRepo(repoUrl);
 
   const requestedBranch = repoBranch?.trim() || "";
+  const knownBranchHints = [...new Set((branchHints || []).map((b) => (b || "").trim()).filter(Boolean))];
   const parsedRepo = parseGithubRepoUrl(repoUrl);
   const cloneUrl = withGithubCredentials(parsedRepo.cloneUrl);
   const slug = sanitizeRepoSlug(repoUrl);
   const repoDir = path.join(EXTERNAL_REPOS_ROOT, slug);
   await fs.mkdir(EXTERNAL_REPOS_ROOT, { recursive: true });
 
+  const normalizeBranchList = (branches) =>
+    [...new Set((branches || []).map((b) => (b || "").trim()).filter(Boolean))]
+      .filter((b) => b !== "HEAD" && !b.startsWith("spec-me/"));
+
   const getRemoteBranchesFromLocal = async () => {
     const { stdout } = await runGit(
       ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
       { cwd: repoDir }
     );
-    return stdout
+    const branches = stdout
       .split("\n")
       .map((s) => s.trim())
       .filter(Boolean)
       .map((s) => s.replace(/^origin\//, ""))
       .filter((s) => s && s !== "HEAD");
+    return normalizeBranchList(branches);
   };
 
   const getRemoteBranchesFromOrigin = async () => {
     const { stdout } = await runGit(["ls-remote", "--heads", "origin"], { cwd: repoDir });
-    return stdout
+    const branches = stdout
       .split("\n")
       .map((line) => {
         const match = line.match(/refs\/heads\/(.+)$/);
         return match?.[1]?.trim() || "";
       })
       .filter(Boolean);
+    return normalizeBranchList(branches);
+  };
+
+  const remoteHasBranch = async (branchName) => {
+    const clean = (branchName || "").trim();
+    if (!clean) return false;
+    try {
+      const { stdout } = await runGit(["ls-remote", "--heads", "origin", `refs/heads/${clean}`], {
+        cwd: repoDir,
+      });
+      return Boolean(stdout.trim());
+    } catch {
+      return false;
+    }
   };
 
   const getRemoteBranches = async () => {
-    const all = new Set();
-    try {
-      for (const b of await getRemoteBranchesFromLocal()) all.add(b);
-    } catch {
-      // Ignore.
-    }
-    try {
-      for (const b of await getRemoteBranchesFromOrigin()) all.add(b);
-    } catch {
-      // Ignore.
-    }
-    return [...all];
+    const origin = await getRemoteBranchesFromOrigin().catch(() => []);
+    if (origin.length > 0) return origin;
+    return await getRemoteBranchesFromLocal().catch(() => []);
   };
 
   const resolveDefaultBranch = async () => {
-    const remoteHasBranch = async (branchName) => {
-      try {
-        const branches = await getRemoteBranches();
-        return branches.includes(branchName);
-      } catch {
-        return false;
+    // 1) Try stored branch hints first.
+    for (const hint of knownBranchHints) {
+      if (await remoteHasBranch(hint)) {
+        console.log(`  Branch detection step 1: using stored branch hint -> ${hint}`);
+        return hint;
       }
-    };
+    }
 
-    // 1) Try origin/HEAD symbolic ref if available.
+    // 2) Use current branch if HEAD is valid and remote has that branch.
+    const headValid = await hasValidHead(repoDir);
+    if (headValid) {
+      try {
+        const current = (await getCurrentBranchName(repoDir)) || "";
+        if (current && current !== "HEAD" && (await remoteHasBranch(current))) {
+          console.log(`  Branch detection step 2: using current branch -> ${current}`);
+          return current;
+        }
+      } catch (err) {
+        console.log(`  Branch detection step 2 (current branch): ${err.message || "failed"}`);
+      }
+    } else {
+      console.log(`  Branch detection step 2: skipped (HEAD is invalid/unborn)`);
+    }
+
+    // 3) Try origin/HEAD symbolic ref if available.
     try {
       await runGit(["remote", "set-head", "origin", "-a"], { cwd: repoDir }).catch(() => {});
       const { stdout } = await runGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
         cwd: repoDir,
       });
       const match = stdout.trim().match(/^origin\/(.+)$/);
-      if (match?.[1]) return match[1];
-    } catch {
-      // fall through
+      if (match?.[1]) {
+        console.log(`  Branch detection step 3: found origin/HEAD -> ${match[1]}`);
+        return match[1];
+      }
+    } catch (err) {
+      console.log(`  Branch detection step 3 (origin/HEAD): ${err.message || "failed"}`);
     }
 
-    // 2) Try remote metadata: git ls-remote --symref origin HEAD
+    // 4) Try remote metadata: git ls-remote --symref origin HEAD
     try {
       const { stdout } = await runGit(["ls-remote", "--symref", "origin", "HEAD"], { cwd: repoDir });
       const line = stdout
@@ -560,33 +1209,77 @@ async function syncRemoteGithubRepo(repoUrl, repoBranch) {
         .find((l) => l.startsWith("ref: refs/heads/") && l.endsWith("\tHEAD"));
       if (line) {
         const branch = line.replace("ref: refs/heads/", "").replace(/\tHEAD$/, "").trim();
-        if (branch) return branch;
+        if (branch) {
+          console.log(`  Branch detection step 4: found via ls-remote -> ${branch}`);
+          return branch;
+        }
       }
-    } catch {
-      // fall through
+    } catch (err) {
+      console.log(`  Branch detection step 4 (ls-remote): ${err.message || "failed"}`);
     }
 
-    // 3) Use current branch if remote has that branch.
-    try {
-      const { stdout } = await runGit(["branch", "--show-current"], { cwd: repoDir });
-      const current = stdout.trim();
-      if (current && current !== "HEAD" && (await remoteHasBranch(current))) return current;
-    } catch {
-      // fall through
+    // 5) Prefer origin/main then origin/master.
+    if (await remoteHasBranch("main")) {
+      console.log(`  Branch detection step 5: found main on remote`);
+      return "main";
+    }
+    if (await remoteHasBranch("master")) {
+      console.log(`  Branch detection step 5: found master on remote`);
+      return "master";
     }
 
-    // 4) Prefer origin/main then origin/master.
-    if (await remoteHasBranch("main")) return "main";
-    if (await remoteHasBranch("master")) return "master";
+    // 6) Fallback to best match from authoritative remote branch list.
+    const originBranches = await getRemoteBranchesFromOrigin().catch(() => []);
+    if (originBranches.length === 1) {
+      console.log(`  Branch detection step 6: using only remote branch -> ${originBranches[0]}`);
+      return originBranches[0];
+    }
+    if (originBranches.length > 1) {
+      const preferred = ["develop", "dev", "trunk", "release"];
+      const pick = preferred.find((b) => originBranches.includes(b));
+      if (pick) {
+        console.log(`  Branch detection step 6: using preferred fallback branch -> ${pick}`);
+        return pick;
+      }
+      console.log(`  Branch detection step 6: ambiguous default branch. Manual selection required.`);
+      throw makeBranchSelectionError(originBranches);
+    }
 
-    // 5) Fallback to first remote branch.
-    const branches = await getRemoteBranches();
-    if (branches.length) return branches[0];
+    const localBranches = await getRemoteBranchesFromLocal().catch(() => []);
+    if (localBranches.length > 0) {
+      console.log(`  Branch detection: origin list unavailable; offering local branch refs for manual selection.`);
+      throw makeBranchSelectionError(localBranches);
+    }
+
+    console.log(`  Branch detection: all steps failed. Available remote branches: []`);
     throw makeBranchSelectionError([]);
   };
 
   const checkoutTrackedBranch = async (branchName) => {
-    await runGit(["fetch", "origin", branchName, "--depth", "1"], { cwd: repoDir });
+    try {
+      await runGit(
+        [
+          "fetch",
+          "--prune",
+          "--depth",
+          "1",
+          "origin",
+          `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`,
+        ],
+        { cwd: repoDir }
+      );
+    } catch (error) {
+      const raw = `${error?.shortMessage || ""}\n${error?.stderr || ""}\n${error?.message || ""}`.toLowerCase();
+      if (raw.includes("couldn't find remote ref") || raw.includes("remote branch") || raw.includes("not found")) {
+        throw makeBranchMissingError(branchName, await getRemoteBranches());
+      }
+      throw error;
+    }
+    try {
+      await runGit(["rev-parse", "--verify", `refs/remotes/origin/${branchName}`], { cwd: repoDir });
+    } catch {
+      throw makeBranchMissingError(branchName, await getRemoteBranches());
+    }
     await runGit(["checkout", "-B", branchName, `origin/${branchName}`], { cwd: repoDir });
     return branchName;
   };
@@ -597,22 +1290,79 @@ async function syncRemoteGithubRepo(repoUrl, repoBranch) {
         await runGit(["clone", "--depth", "1", "--branch", requestedBranch, cloneUrl, repoDir], {
           cwd: PROJECT_ROOT,
         });
-        const gitStatus = await getGitSyncStatus(repoDir, requestedBranch);
+        const gitStatus = await getGitSyncStatus(repoDir, requestedBranch).catch(() => null);
         return { repoDir, branch: requestedBranch, gitStatus };
       }
       throw new Error("No branch requested; cloning default branch.");
-    } catch {
-      await runGit(["clone", "--depth", "1", cloneUrl, repoDir], { cwd: PROJECT_ROOT });
-      const active = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir });
-      const branch = active.stdout.trim() || "unknown";
+    } catch (cloneErr) {
+      // If requested branch clone failed, try default clone
+      if (!fsSync.existsSync(repoDir)) {
+        await runGit(["clone", "--depth", "1", cloneUrl, repoDir], { cwd: PROJECT_ROOT });
+      }
+
+      // After clone, detect branch safely (HEAD may be unborn for empty repos)
+      let branch = "unknown";
+      const headValid = await hasValidHead(repoDir);
+      if (headValid) {
+        try {
+          const active = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir });
+          branch = active.stdout.trim() || "unknown";
+        } catch {
+          branch = "unknown";
+        }
+      } else {
+        // Unborn HEAD: try symbolic-ref to get the configured branch name
+        try {
+          const { stdout } = await runGit(["symbolic-ref", "--short", "HEAD"], { cwd: repoDir });
+          branch = stdout.trim() || "unknown";
+        } catch {
+          branch = "unknown";
+        }
+        console.log(`  Cloned repo has unborn HEAD (empty repo?). Branch: ${branch}`);
+      }
       const gitStatus = await getGitSyncStatus(repoDir, branch).catch(() => null);
       return { repoDir, branch, gitStatus };
     }
   }
 
-  await ensureGitRepoRoot(repoDir);
-  await runGit(["remote", "set-url", "origin", cloneUrl], { cwd: repoDir });
-  await runGit(["fetch", "--all", "--prune"], { cwd: repoDir }).catch(() => {});
+  // Validate existing repo; if corrupted, wipe and re-clone
+  try {
+    await ensureGitRepoRoot(repoDir);
+    await runGit(["remote", "set-url", "origin", cloneUrl], { cwd: repoDir });
+    await runGit(["fetch", "--all", "--prune"], { cwd: repoDir });
+  } catch (existingRepoErr) {
+    const errStr = `${existingRepoErr?.stderr || ""} ${existingRepoErr?.message || ""}`.toLowerCase();
+    const isNetworkOrAuth =
+      errStr.includes("authentication") ||
+      errStr.includes("could not resolve") ||
+      errStr.includes("permission denied") ||
+      errStr.includes("timed out") ||
+      errStr.includes("repository not found") ||
+      errStr.includes("could not read from remote");
+    if (isNetworkOrAuth) throw existingRepoErr;
+    // Local corruption: wipe and re-clone
+    console.log(`  Existing repo at ${repoDir} appears corrupted. Removing for fresh clone.`);
+    await fs.rm(repoDir, { recursive: true, force: true });
+    await runGit(["clone", "--depth", "1", cloneUrl, repoDir], { cwd: PROJECT_ROOT });
+    await runGit(["remote", "set-url", "origin", cloneUrl], { cwd: repoDir });
+    await runGit(["fetch", "--all", "--prune"], { cwd: repoDir });
+  }
+
+  // Check if remote has any branches at all (empty repo detection)
+  const remoteBranches = await getRemoteBranches();
+  if (remoteBranches.length === 0) {
+    // Truly empty remote repo: no branches exist. Accept the current state.
+    console.log("  Remote repo is empty (no branches). Accepting current local clone state.");
+    let branch = requestedBranch || "main";
+    try {
+      const { stdout } = await runGit(["symbolic-ref", "--short", "HEAD"], { cwd: repoDir });
+      if (stdout.trim()) branch = stdout.trim();
+    } catch {
+      // keep default
+    }
+    const gitStatus = await getGitSyncStatus(repoDir, branch).catch(() => null);
+    return { repoDir, branch, gitStatus };
+  }
 
   try {
     if (!requestedBranch) {
@@ -621,8 +1371,14 @@ async function syncRemoteGithubRepo(repoUrl, repoBranch) {
     const checked = await checkoutTrackedBranch(requestedBranch);
     const gitStatus = await getGitSyncStatus(repoDir, checked).catch(() => null);
     return { repoDir, branch: checked, gitStatus };
-  } catch {
-    const remoteBranches = await getRemoteBranches();
+  } catch (requestedErr) {
+    if (requestedErr?.code === "branch_missing") {
+      const branches = await getRemoteBranches();
+      if (branches.length) {
+        throw makeBranchSelectionError(branches);
+      }
+      throw requestedErr;
+    }
     const defaultBranch = await resolveDefaultBranch().catch((err) => {
       if (err?.code === "branch_selection_required") {
         throw makeBranchSelectionError(remoteBranches);
@@ -655,6 +1411,41 @@ function resolveOutputPath(baseRoot, relPath) {
   return { normalized, target };
 }
 
+function toDestinationRelativePath(filePath, projectRoot = "") {
+  const raw = (filePath || "").toString().trim();
+  if (!raw) throw new Error("Missing file path.");
+
+  if (path.isAbsolute(raw)) {
+    const absolute = path.resolve(raw);
+    if (!projectRoot) {
+      throw new Error(`Absolute file path is not allowed without an active project root: ${raw}`);
+    }
+    const resolvedProjectRoot = path.resolve(projectRoot);
+    if (!isSameOrInsidePath(resolvedProjectRoot, absolute)) {
+      throw new Error(`Absolute file path is outside active project root: ${raw}`);
+    }
+    const relativeFromProject = path.relative(resolvedProjectRoot, absolute);
+    const normalized = normalizeRelativePath(relativeFromProject);
+    if (!normalized) {
+      throw new Error(`Refusing to write project root as a file: ${raw}`);
+    }
+    return normalized;
+  }
+
+  return normalizeRelativePath(raw);
+}
+
+function expandHomePath(inputPath) {
+  const input = (inputPath || "").trim();
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (!home) return input;
+  if (input === "~") return home;
+  if (input.startsWith("~/") || input.startsWith("~\\")) {
+    return path.join(home, input.slice(2));
+  }
+  return input;
+}
+
 function toProjectSnapshot(project, extras = {}) {
   return {
     projectType: project.mode || "workspace",
@@ -683,7 +1474,11 @@ function withConnectedState(project) {
 
 function failedActiveProject(message) {
   return {
-    ...defaultActiveProject(),
+    mode: "workspace",
+    root: "",
+    source: "workspace",
+    repoUrl: null,
+    branch: null,
     connectionStatus: "failed",
     lastConnectionError: message,
   };
@@ -699,16 +1494,36 @@ async function assertProjectReady(project) {
   if (project.mode === "workspace") {
     throw new Error("No project connected. Connect a GitHub repository or local folder first.");
   }
-  if (project.mode === "github") {
-    try {
-      await ensureGitRepoRoot(project.root);
-    } catch {
-      throw new Error("GitHub mode requires a valid git working copy. Reconnect the GitHub project and retry.");
+  if (!project.root || !project.root.trim()) {
+    throw new Error("No active project path. The project connection is invalid. Reconnect from Sync.");
+  }
+  const rootStat = await fs.stat(project.root).catch(() => null);
+  if (!rootStat || !rootStat.isDirectory()) {
+    throw new Error(`Project folder does not exist: ${project.root}. Reconnect and retry.`);
+  }
+  const projectRoot = path.resolve(project.root);
+  if (project.mode === "local") {
+    const blockedRoots = getBlockedInternalRoots();
+    if (blockedRoots.some((blockedRoot) => isSameOrInsidePath(blockedRoot, projectRoot))) {
+      throw new Error(
+        "Selected project path points to SpecMe internal folders. " +
+        "Reconnect using your target repository/folder outside the SpecMe app directory."
+      );
     }
-  } else if (project.mode === "local") {
-    const stat = await fs.stat(project.root).catch(() => null);
-    if (!stat || !stat.isDirectory()) {
-      throw new Error("Local project folder is unavailable. Reconnect the local project and retry.");
+  }
+  if (project.mode === "github") {
+    const expectedRoot = path.resolve(EXTERNAL_REPOS_ROOT);
+    if (projectRoot !== expectedRoot && !projectRoot.startsWith(`${expectedRoot}${path.sep}`)) {
+      throw new Error(
+        "GitHub mode active but project path is outside the managed GitHub working copies. " +
+        "Reconnect the GitHub project from Sync."
+      );
+    }
+    if (!(await isValidGitRepo(project.root))) {
+      throw new Error(
+        "GitHub mode active but target path is not a valid git repository. " +
+        "This may indicate a project source mismatch. Reconnect the GitHub project from Sync."
+      );
     }
   }
 }
@@ -717,7 +1532,7 @@ async function activateProjectDescriptor(descriptor) {
   const mode = descriptor?.mode || "workspace";
   if (mode === "github") {
     const repoUrl = descriptor?.repoUrl?.trim();
-    const repoBranch = descriptor?.branch?.trim() || "main";
+    const repoBranch = descriptor?.branch?.trim() || "";
     if (!repoUrl) throw new Error("Stored GitHub project is missing repository URL.");
     const synced = await syncRemoteGithubRepo(repoUrl, repoBranch);
     const project = withConnectedState({
@@ -772,6 +1587,19 @@ async function resolveLocalProject(localPath) {
 }
 
 async function buildContext(syncRoot, sourceLabel) {
+  // Guardrail: refuse to index if syncRoot is empty or missing
+  if (!syncRoot || !syncRoot.trim()) {
+    console.warn("⚠️ buildContext called with empty root, skipping indexing.");
+    await fs.writeFile(CONTEXT_PATH, `--- SPEC ME DYNAMIC CONTEXT ---\nSOURCE: ${sourceLabel}\n\n(No project indexed - root path is empty)\n`, "utf-8");
+    return { fileCount: 0, contextPath: CONTEXT_PATH };
+  }
+  const rootStat = await fs.stat(syncRoot).catch(() => null);
+  if (!rootStat || !rootStat.isDirectory()) {
+    console.warn(`⚠️ buildContext: root does not exist or is not a directory: ${syncRoot}`);
+    await fs.writeFile(CONTEXT_PATH, `--- SPEC ME DYNAMIC CONTEXT ---\nSOURCE: ${sourceLabel}\n\n(No project indexed - path unavailable)\n`, "utf-8");
+    return { fileCount: 0, contextPath: CONTEXT_PATH };
+  }
+
   const EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".json", ".sql", ".css", ".md", ".html"]);
   const IGNORE = new Set([
     "node_modules",
@@ -818,6 +1646,25 @@ app.get("/api/project", async (_req, res) => {
     res.json({ success: true, project });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/api/save-local-destination", async (_req, res) => {
+  try {
+    const activeProject = await loadActiveProject();
+    await assertProjectReady(activeProject);
+    const remembered = await getRememberedLocalSaveDestination(activeProject);
+    res.json({
+      success: true,
+      destinationPath: remembered.destinationPath,
+      exists: remembered.exists,
+      missingReason: remembered.missingReason,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
   }
 });
 
@@ -946,44 +1793,86 @@ app.post("/api/runs/activate", async (req, res) => {
 
 app.post("/api/save-local-changes", async (req, res) => {
   try {
+    const activeProject = await loadActiveProject();
+    await assertProjectReady(activeProject);
+
     const destinationPathInput = req.body?.destinationPath?.toString().trim();
     const files = Array.isArray(req.body?.files) ? req.body.files : [];
     if (!destinationPathInput) throw new Error("destinationPath is required.");
     if (!files.length) throw new Error("No files provided.");
 
-    const destinationRoot = path.isAbsolute(destinationPathInput)
-      ? path.resolve(destinationPathInput)
-      : path.resolve(PROJECT_ROOT, destinationPathInput);
+    const expandedDestination = expandHomePath(destinationPathInput);
+    if (!path.isAbsolute(expandedDestination)) {
+      throw new Error(
+        "Destination path must be absolute. Select a destination folder explicitly (for example: /Users/you/Desktop/output)."
+      );
+    }
+    const destinationRoot = path.resolve(expandedDestination);
+    const blockedRoots = getBlockedInternalRoots();
+    if (blockedRoots.some((blockedRoot) => isSameOrInsidePath(blockedRoot, destinationRoot))) {
+      throw new Error(
+        "Destination path cannot be SpecMe's app/internal folder. Choose a separate project/output directory."
+      );
+    }
+    const activeProjectRoot = path.resolve(activeProject.root);
 
     await fs.mkdir(destinationRoot, { recursive: true });
 
     let written = 0;
     const results = [];
+    const skipped = [];
     for (const f of files) {
       const fileName = f?.fileName?.toString?.() ?? "";
       const fullCode = f?.fullCode;
-      if (!fileName || fullCode === undefined) continue;
-
-      const { normalized, target } = resolveOutputPath(destinationRoot, fileName);
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(target, String(fullCode), "utf-8");
-      written++;
-      results.push({ fileName: normalized });
+      if (!fileName || fullCode === undefined) {
+        skipped.push({ fileName: fileName || "(missing)", reason: "Missing fileName or fullCode." });
+        continue;
+      }
+      try {
+        const relativeOutputPath = toDestinationRelativePath(fileName, activeProjectRoot);
+        const { normalized, target } = resolveOutputPath(destinationRoot, relativeOutputPath);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.writeFile(target, String(fullCode), "utf-8");
+        written++;
+        results.push({ fileName: normalized });
+      } catch (fileError) {
+        skipped.push({
+          fileName,
+          reason: fileError?.message || "Failed to write file.",
+        });
+      }
     }
+
+    if (written === 0) {
+      throw new Error(
+        `No files were saved. ${skipped.length ? `First error: ${skipped[0].reason}` : "No valid files were provided."}`
+      );
+    }
+
+    const remembered = await rememberLocalSaveDestination(activeProject, destinationRoot);
 
     res.json({
       success: true,
-      message: `Saved ${written} file(s) to ${destinationRoot}`,
+      message:
+        skipped.length > 0
+          ? `Saved ${written} file(s) to ${destinationRoot}. Skipped ${skipped.length} file(s).`
+          : `Saved ${written} file(s) to ${destinationRoot}`,
       destinationRoot,
+      rememberedDestinationPath: remembered.destinationPath,
       written,
       files: results,
+      skipped,
     });
   } catch (error) {
+    const classified = classifyLocalSaveError(error);
     res.status(500).json({
       success: false,
       error: error.message,
-      reason: "save_local_failed",
-      reconnectManualHint: "Choose an accessible folder path and retry.",
+      reason: classified.reason,
+      reasonMessage: classified.reasonMessage,
+      exactReason: classified.exactReason,
+      nextSteps: classified.nextSteps,
+      technicalDetails: classified.technicalDetails,
     });
   }
 });
@@ -1077,7 +1966,7 @@ app.post("/api/analyze", async (req, res) => {
     });
 
     const result = await model.generateContent(`CODEBASE CONTEXT:\n${codebase}\n\nUSER REQUEST: ${message}`);
-    const data = JSON.parse(result.response.text());
+    const data = await buildGuaranteedAnalyzeData(model, message, result.response.text());
 
     for (const f of data.files_to_modify ?? []) {
       try {
@@ -1092,7 +1981,16 @@ app.post("/api/analyze", async (req, res) => {
     res.json({ success: true, data, project: activeProject });
   } catch (error) {
     console.error("/api/analyze error:", error.message);
-    res.status(500).json({ success: false, error: error.message });
+    const classified = classifyAnalyzeError(error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      reason: classified.reason,
+      reasonMessage: classified.reasonMessage,
+      exactReason: classified.exactReason,
+      nextSteps: classified.nextSteps,
+      technicalDetails: classified.technicalDetails,
+    });
   }
 });
 
@@ -1137,7 +2035,7 @@ app.post("/api/sync", async (req, res) => {
   try {
     const mode = req.body?.mode?.trim() || "";
     const repoUrl = req.body?.repoUrl?.trim() || "";
-    const repoBranch = req.body?.repoBranch?.trim() || "main";
+    const repoBranch = req.body?.repoBranch?.trim() || "";
     const localPath = req.body?.localPath?.trim() || "";
 
     let nextProject = defaultActiveProject();
@@ -1147,7 +2045,8 @@ app.post("/api/sync", async (req, res) => {
       if (!repoUrl) {
         throw new Error("Repository URL is required for GitHub mode.");
       }
-      const synced = await syncRemoteGithubRepo(repoUrl, repoBranch);
+      const branchHints = await getStoredBranchHints(repoUrl);
+      const synced = await syncRemoteGithubRepo(repoUrl, repoBranch, branchHints);
       githubSyncMeta = synced;
       nextProject = withConnectedState({
         mode: "github",
@@ -1184,15 +2083,20 @@ app.post("/api/sync", async (req, res) => {
     console.error("/api/sync error:", error.message);
     const mode = req.body?.mode?.trim() || (req.body?.repoUrl ? "github" : req.body?.localPath ? "local" : "workspace");
     const reason = buildReconnectError(mode, error);
+    // Save failed state with empty root to prevent fallback indexing/editing
     await saveActiveProject(failedActiveProject(reason.message));
+    // Do NOT call buildContext here - failed sync must not index any folder
     res.status(500).json({
       success: false,
       error: reason.message,
       reason: reason.code,
+      reasonMessage: reason.message,
+      exactReason: reason.message,
+      nextSteps: reconnectNextSteps(reason.code),
+      technicalDetails: `${error?.code || "unknown"}\n${error?.message || ""}`.trim(),
       availableBranches: reason.availableBranches || [],
       reconnectAction: "manual",
       retryable: true,
-      reconnectManualHint: "Open Sync and reconnect manually.",
     });
   }
 });
@@ -1203,8 +2107,31 @@ app.post("/api/push", async (req, res) => {
     if (activeProject.mode !== "github") {
       throw new Error("Push is only available for GitHub project mode.");
     }
+    if (activeProject.connectionStatus === "failed") {
+      throw new Error("GitHub connection is in a failed state. Reconnect from Sync before pushing.");
+    }
+    if (!activeProject.root || !activeProject.root.trim()) {
+      throw new Error("No project path set. Reconnect the GitHub project from Sync.");
+    }
 
     await ensureGitRepoRoot(activeProject.root);
+
+    // Apply any provided files to the working copy before committing
+    const filesToApply = Array.isArray(req.body?.files) ? req.body.files : [];
+    if (filesToApply.length > 0) {
+      // Create safety branch so we don't commit directly to the default branch
+      await createSafetyBranch(activeProject.root, "push-batch");
+      for (const f of filesToApply) {
+        const fileName = f?.fileName?.toString?.() ?? "";
+        const fullCode = f?.fullCode;
+        if (!fileName || fullCode === undefined) continue;
+        const normalized = normalizeRelativePath(fileName);
+        if (normalized.includes(".env") || normalized.endsWith("lock.json")) continue;
+        const { target } = resolvePathInRoot(activeProject.root, fileName);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.writeFile(target, String(fullCode), "utf-8");
+      }
+    }
 
     const commitMessage = (req.body?.message || "SpecMe automated updates").toString().trim();
     await runGit(["add", "-A"], { cwd: activeProject.root });
@@ -1216,27 +2143,75 @@ app.post("/api/push", async (req, res) => {
 
     await runGit(["commit", "-m", commitMessage], { cwd: activeProject.root });
 
-    const branch = activeProject.branch || (await runGit(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: activeProject.root })).stdout.trim();
+    const headValid = await hasValidHead(activeProject.root);
+    if (!headValid) {
+      throw new Error("Cannot push: repository HEAD is invalid. The repo may have no commits.");
+    }
+
+    const checkedOutBranch = await getCurrentBranchName(activeProject.root);
+    const sourceBranch = (checkedOutBranch || "").trim();
+    if (!sourceBranch || sourceBranch === "HEAD") {
+      throw new Error("Cannot determine the checked-out branch for push.");
+    }
+
+    // Push to the actively connected target branch when available, otherwise to the current branch.
+    const targetBranch = (activeProject.branch || sourceBranch).trim();
+    const pushRefspec = sourceBranch === targetBranch ? sourceBranch : `${sourceBranch}:${targetBranch}`;
+    const pushArgs = ["push", "--set-upstream", "origin", pushRefspec];
+    const attemptedCommand = `git ${pushArgs.join(" ")}`;
 
     try {
-      await runGit(["push", "origin", branch], { cwd: activeProject.root });
+      await runGit(pushArgs, { cwd: activeProject.root });
+
+      if (activeProject.branch !== targetBranch) {
+        await saveActiveProject({
+          ...activeProject,
+          branch: targetBranch,
+        });
+      }
+
       return res.json({
         success: true,
-        message: `Committed and pushed to ${branch}`,
+        message: `Committed and pushed ${sourceBranch} to ${targetBranch}`,
         pushed: true,
-        branch,
+        sourceBranch,
+        branch: targetBranch,
+        command: attemptedCommand,
       });
     } catch (pushError) {
+      const parsedFailure = classifyPushFailure(pushError);
+
       return res.status(500).json({
         success: false,
-        error: `Push failed: ${pushError.message}`,
+        error: pushError?.shortMessage || pushError?.message || "Push failed.",
+        reason: parsedFailure.reason,
+        reasonMessage: parsedFailure.reasonMessage,
+        exactReason:
+          parsedFailure.exactReason ||
+          pushError?.shortMessage ||
+          pushError?.message ||
+          "Push failed.",
+        nextSteps: parsedFailure.nextSteps,
+        technicalDetails: `${pushError?.stderr || ""}\n${pushError?.shortMessage || ""}\n${pushError?.message || ""}`.trim(),
+        command: attemptedCommand,
+        sourceBranch,
+        targetBranch,
         pushed: false,
         changesKeptLocally: true,
       });
     }
   } catch (error) {
     console.error("/api/push error:", error.message);
-    res.status(500).json({ success: false, error: error.message, changesKeptLocally: true });
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      reason: "push_failed",
+      reasonMessage: "Push to GitHub failed.",
+      exactReason: error.message,
+      nextSteps: "Check repository permissions and network state, then retry the push.",
+      technicalDetails: `${error?.code || "unknown"}\n${error?.message || ""}`.trim(),
+      changesKeptLocally: true,
+    });
   }
 });
 

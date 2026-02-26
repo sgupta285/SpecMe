@@ -8,6 +8,7 @@ import { useToast } from "@/hooks/use-toast";
 import { format } from "date-fns";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/integrations/supabase/client";
+import { apiFetch } from "@/lib/api";
 
 type RunRow = {
   id: string;
@@ -55,6 +56,36 @@ type BackendProject = {
   lastConnectionError?: string | null;
 };
 
+function toProjectConnectionFromBackend(
+  backend: BackendProject,
+  fallback: ProjectConnection
+): ProjectConnection {
+  if (backend.connectionStatus === "failed") {
+    return { kind: "none", repoUrl: "", repoBranch: "main", localPath: "" };
+  }
+  if (backend.mode === "github" && backend.connectionStatus === "connected") {
+    return {
+      kind: "github",
+      repoUrl: backend.repoUrl || fallback.repoUrl,
+      repoBranch: backend.branch || fallback.repoBranch || "main",
+      localPath: "",
+    };
+  }
+  if (backend.mode === "local" && backend.connectionStatus === "connected") {
+    const sourcePath =
+      backend.source?.startsWith("local:")
+        ? backend.source.slice("local:".length)
+        : backend.root || fallback.localPath;
+    return {
+      kind: "local",
+      repoUrl: "",
+      repoBranch: fallback.repoBranch || "main",
+      localPath: sourcePath || "",
+    };
+  }
+  return { kind: "none", repoUrl: "", repoBranch: "main", localPath: "" };
+}
+
 function parseProjectConnection(repoUrl: string | null, repoBranch: string | null): ProjectConnection {
   const raw = (repoUrl ?? "").trim();
   if (!raw) {
@@ -74,12 +105,6 @@ function parseProjectConnection(repoUrl: string | null, repoBranch: string | nul
     repoBranch: repoBranch?.trim() || "main",
     localPath: "",
   };
-}
-
-function getApiBase() {
-  const raw = (import.meta.env.VITE_API_URL ?? "").toString().trim();
-  if (!raw) return "";
-  return raw.replace(/\/$/, "");
 }
 
 export default function Dashboard() {
@@ -116,8 +141,7 @@ export default function Dashboard() {
       const fallbackProject = parseProjectConnection(settings?.repo_url ?? null, settings?.repo_branch ?? null);
       setProject(fallbackProject);
 
-      const apiBase = getApiBase();
-      const backendRes = await fetch(`${apiBase}/api/project`).catch(() => null);
+      const backendRes = await apiFetch("/api/project").catch(() => null);
       if (backendRes?.ok) {
         const parsed = (await backendRes.json()) as {
           success?: boolean;
@@ -125,27 +149,7 @@ export default function Dashboard() {
         };
         if (parsed.success && parsed.project) {
           setBackendProject(parsed.project);
-          if (parsed.project.mode === "github") {
-            setProject({
-              kind: "github",
-              repoUrl: parsed.project.repoUrl || fallbackProject.repoUrl,
-              repoBranch: parsed.project.branch || fallbackProject.repoBranch || "main",
-              localPath: "",
-            });
-          } else if (parsed.project.mode === "local") {
-            const sourcePath =
-              parsed.project.source?.startsWith("local:")
-                ? parsed.project.source.slice("local:".length)
-                : parsed.project.root || fallbackProject.localPath;
-            setProject({
-              kind: "local",
-              repoUrl: "",
-              repoBranch: fallbackProject.repoBranch || "main",
-              localPath: sourcePath || "",
-            });
-          } else {
-            setProject({ kind: "none", repoUrl: "", repoBranch: "main", localPath: "" });
-          }
+          setProject(toProjectConnectionFromBackend(parsed.project, fallbackProject));
         }
       } else {
         setBackendProject({
@@ -156,13 +160,13 @@ export default function Dashboard() {
         setProject({ kind: "none", repoUrl: "", repoBranch: "main", localPath: "" });
       }
 
-      const attemptRes = await fetch(`${apiBase}/api/attempt/latest`).catch(() => null);
+      const attemptRes = await apiFetch("/api/attempt/latest").catch(() => null);
       if (attemptRes?.ok) {
         const parsed = (await attemptRes.json()) as { hasUndoableChanges?: boolean };
         setHasUndoableChanges(Boolean(parsed.hasUndoableChanges));
       }
 
-      const historyRes = await fetch(`${apiBase}/api/project/history`).catch(() => null);
+      const historyRes = await apiFetch("/api/project/history").catch(() => null);
       if (historyRes?.ok) {
         const parsed = (await historyRes.json()) as {
           success?: boolean;
@@ -238,8 +242,14 @@ export default function Dashboard() {
 
   const connectionStatusText = useMemo(() => {
     if (!backendProject) return "No project connected";
-    if (backendProject.connectionStatus === "failed") return "Project connection failed";
+    if (backendProject.connectionStatus === "failed") {
+      return "Project connection failed";
+    }
     if (backendProject.mode === "workspace" || backendProject.connectionStatus === "disconnected") {
+      return "No project connected";
+    }
+    // Only show "connected" if backend confirms connection is actually valid
+    if (backendProject.connectionStatus !== "connected") {
       return "No project connected";
     }
     if (project.kind === "none") return "No project connected";
@@ -248,8 +258,7 @@ export default function Dashboard() {
   }, [project.kind, backendProject]);
 
   const refreshAttemptStatus = async () => {
-    const apiBase = getApiBase();
-    const res = await fetch(`${apiBase}/api/attempt/latest`).catch(() => null);
+    const res = await apiFetch("/api/attempt/latest").catch(() => null);
     if (!res?.ok) return;
     const parsed = (await res.json()) as { hasUndoableChanges?: boolean };
     setHasUndoableChanges(Boolean(parsed.hasUndoableChanges));
@@ -275,8 +284,7 @@ export default function Dashboard() {
 
     setDisconnecting(kind);
     try {
-      const apiBase = getApiBase();
-      const disconnectRes = await fetch(`${apiBase}/api/project/disconnect`, {
+      const disconnectRes = await apiFetch("/api/project/disconnect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -329,9 +337,8 @@ export default function Dashboard() {
   };
 
   const openRunWithReconnect = async (runId: string) => {
-    const apiBase = getApiBase();
     try {
-      const activateRes = await fetch(`${apiBase}/api/runs/activate`, {
+      const activateRes = await apiFetch("/api/runs/activate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ runId }),
@@ -343,6 +350,7 @@ export default function Dashboard() {
             success?: boolean;
             message?: string;
             reconnectManualHint?: string;
+            project?: BackendProject;
           };
           if (parsed.success === false) {
             const detail = [parsed.message, parsed.reconnectManualHint]
@@ -353,6 +361,10 @@ export default function Dashboard() {
               description: detail || "Could not auto-reconnect. Reconnect manually from Sync.",
               variant: "destructive",
             });
+          }
+          if (parsed.project) {
+            setBackendProject(parsed.project);
+            setProject(toProjectConnectionFromBackend(parsed.project, project));
           }
         } catch {
           // no-op
@@ -379,8 +391,7 @@ export default function Dashboard() {
     if (!shouldDelete) return;
     setDeletingHistoryRunId(runId);
     try {
-      const apiBase = getApiBase();
-      const res = await fetch(`${apiBase}/api/project/history/${runId}`, {
+      const res = await apiFetch(`/api/project/history/${runId}`, {
         method: "DELETE",
       });
       const raw = await res.text();

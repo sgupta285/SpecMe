@@ -8,7 +8,6 @@ import { useToast } from "@/hooks/use-toast";
 import {
   ArrowLeft,
   Copy,
-  Download,
   FileCode,
   Loader2,
   Check,
@@ -22,6 +21,10 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import type { Json } from "@/integrations/supabase/types";
+import { apiFetch } from "@/lib/api";
+import ErrorDialog, { type ErrorDialogState } from "@/components/ErrorDialog";
+import { buildUiError, parseApiErrorText, shouldUseErrorDialog } from "@/lib/errors";
+import { parseJsonText, stringifyPrettyJson } from "@/lib/json";
 
 type SpecFile = {
   fileName: string;
@@ -56,7 +59,7 @@ type RunMessage = {
   user_id: string;
   role: "user" | "assistant";
   content: string;
-  spec_output: SpecOutput | null;
+  spec_output: Json | null;
   created_at: string;
 };
 
@@ -86,6 +89,84 @@ type ProjectInfo = {
   lastConnectionError?: string | null;
 };
 
+type LocalDirectoryHandle = {
+  getDirectoryHandle: (
+    name: string,
+    options?: { create?: boolean }
+  ) => Promise<LocalDirectoryHandle>;
+  getFileHandle: (
+    name: string,
+    options?: { create?: boolean }
+  ) => Promise<{
+    createWritable: () => Promise<{
+      write: (contents: string) => Promise<void>;
+      close: () => Promise<void>;
+    }>;
+  }>;
+};
+
+function stableSortJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stableSortJson(item));
+  }
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const sortedKeys = Object.keys(obj).sort((a, b) => a.localeCompare(b));
+    const next: Record<string, unknown> = {};
+    for (const key of sortedKeys) {
+      next[key] = stableSortJson(obj[key]);
+    }
+    return next;
+  }
+  return value;
+}
+
+function formatSpecText(spec: SpecOutput | null) {
+  if (!spec) return "";
+  const sections: string[] = [];
+  if (spec.summary?.trim()) sections.push(`Summary\n${spec.summary.trim()}`);
+  if (spec.technical_rationale?.trim()) {
+    sections.push(`Technical Rationale\n${spec.technical_rationale.trim()}`);
+  }
+  if (spec.project_type?.trim()) sections.push(`Project Type\n${spec.project_type.trim()}`);
+  if ((spec.risks ?? []).length) {
+    sections.push(`Risks\n${(spec.risks ?? []).map((r) => `- ${r}`).join("\n")}`);
+  }
+  if ((spec.next_steps ?? []).length) {
+    sections.push(
+      `Next Steps\n${(spec.next_steps ?? []).map((step, idx) => `${idx + 1}. ${step}`).join("\n")}`
+    );
+  }
+  if ((spec.files_to_modify ?? []).length) {
+    sections.push(
+      `Files To Modify\n${(spec.files_to_modify ?? [])
+        .map((file) =>
+          file.explanation?.trim()
+            ? `- ${file.fileName}: ${file.explanation}`
+            : `- ${file.fileName}`
+        )
+        .join("\n")}`
+    );
+  }
+  return sections.join("\n\n");
+}
+
+function normalizeSpecOutput(raw: unknown): SpecOutput | null {
+  if (raw == null) return null;
+  let value: unknown = raw;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      value = parseJsonText(trimmed, "spec output");
+    } catch {
+      return null;
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as SpecOutput;
+}
+
 export default function RunDetail() {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
@@ -104,6 +185,7 @@ export default function RunDetail() {
   const [savingLocal, setSavingLocal] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("changes");
   const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null);
+  const [rememberedLocalDestination, setRememberedLocalDestination] = useState<string>("");
   const [currentAttemptId, setCurrentAttemptId] = useState<string | null>(null);
   const [hasUndoableChanges, setHasUndoableChanges] = useState(false);
 
@@ -117,12 +199,14 @@ export default function RunDetail() {
   // Chat input
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
-
-  const getApiBase = () =>
-    (import.meta.env.VITE_API_URL || "http://localhost:4000").replace(
-      /\/$/,
-      ""
-    );
+  const [errorDialog, setErrorDialog] = useState<ErrorDialogState>({
+    open: false,
+    title: "",
+    explanation: "",
+    reason: "",
+    nextSteps: "",
+    technicalDetails: "",
+  });
 
   /**
    * ✅ IMPORTANT:
@@ -134,6 +218,25 @@ export default function RunDetail() {
    */
   type UnsafeFrom = (table: string) => ReturnType<(typeof supabase)["from"]>;
   const sbUnsafe = supabase as unknown as { from: UnsafeFrom };
+
+  const getProjectLabel = useCallback((project?: ProjectInfo | null, fallback?: string | null) => {
+    if (project?.mode === "github" && project.repoUrl) {
+      return project.branch ? `${project.repoUrl}#${project.branch}` : project.repoUrl;
+    }
+    if (project?.mode === "local" && project.root) {
+      return project.root;
+    }
+    return fallback ?? null;
+  }, []);
+
+  const applyProjectState = useCallback(
+    (project?: ProjectInfo | null) => {
+      if (!project) return;
+      setProjectInfo(project);
+      setRepoUrl(getProjectLabel(project, null));
+    },
+    [getProjectLabel]
+  );
 
   const loadRun = useCallback(async () => {
     if (!id || !user) return;
@@ -169,8 +272,7 @@ export default function RunDetail() {
 
       // Auto-reconnect the project source this run originally used.
       try {
-        const apiBase = getApiBase();
-        const activateRes = await fetch(`${apiBase}/api/runs/activate`, {
+        const activateRes = await apiFetch("/api/runs/activate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ runId: typed.id }),
@@ -203,8 +305,9 @@ export default function RunDetail() {
               connectionStatus: "failed",
               lastConnectionError: parsed.message || "Project reconnect failed",
             });
+            setRepoUrl(null);
           } else if (parsed.success && parsed.project) {
-            setProjectInfo(parsed.project);
+            applyProjectState(parsed.project);
           }
         } catch {
           // ignore JSON parse issue; non-blocking for run view
@@ -223,7 +326,7 @@ export default function RunDetail() {
     }
 
     setLoading(false);
-  }, [id, user, toast]);
+  }, [id, user, toast, applyProjectState]);
 
   const loadThread = useCallback(async () => {
     if (!id || !user) return;
@@ -252,25 +355,23 @@ export default function RunDetail() {
 
   const loadProjectInfo = useCallback(async () => {
     try {
-      const apiBase = getApiBase();
-      const res = await fetch(`${apiBase}/api/project`);
+      const res = await apiFetch("/api/project");
       if (!res.ok) return;
       const parsed = (await res.json()) as {
         success?: boolean;
         project?: ProjectInfo;
       };
       if (parsed?.success && parsed.project) {
-        setProjectInfo(parsed.project);
+        applyProjectState(parsed.project);
       }
     } catch {
       // Non-blocking for RunDetail rendering
     }
-  }, []);
+  }, [applyProjectState]);
 
   const loadAttemptStatus = useCallback(async () => {
     try {
-      const apiBase = getApiBase();
-      const res = await fetch(`${apiBase}/api/attempt/latest`);
+      const res = await apiFetch("/api/attempt/latest");
       if (!res.ok) return;
       const parsed = (await res.json()) as {
         success?: boolean;
@@ -282,6 +383,36 @@ export default function RunDetail() {
       setCurrentAttemptId(parsed.attempt?.id || null);
     } catch {
       // Non-blocking
+    }
+  }, []);
+
+  const loadRememberedLocalDestination = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/save-local-destination");
+      if (!res.ok) {
+        setRememberedLocalDestination("");
+        return null;
+      }
+      const parsed = (await res.json()) as {
+        success?: boolean;
+        destinationPath?: string | null;
+        exists?: boolean;
+        missingReason?: string;
+      };
+      if (!parsed?.success) {
+        setRememberedLocalDestination("");
+        return null;
+      }
+      const remembered = (parsed.destinationPath || "").trim();
+      setRememberedLocalDestination(remembered);
+      return {
+        destinationPath: remembered,
+        exists: Boolean(parsed.exists),
+        missingReason: parsed.missingReason || "",
+      };
+    } catch {
+      setRememberedLocalDestination("");
+      return null;
     }
   }, []);
 
@@ -301,6 +432,10 @@ export default function RunDetail() {
     loadAttemptStatus();
   }, [loadAttemptStatus]);
 
+  useEffect(() => {
+    void loadRememberedLocalDestination();
+  }, [projectInfo?.mode, projectInfo?.root, projectInfo?.repoUrl, projectInfo?.branch, loadRememberedLocalDestination]);
+
   // Choose which spec to display:
   // - if user clicked a past assistant output => show that
   // - else show latest assistant output in thread
@@ -308,7 +443,8 @@ export default function RunDetail() {
   const assistantSpecs = useMemo(() => {
     return messages
       .filter((m) => m.role === "assistant" && m.spec_output)
-      .map((m) => m.spec_output as SpecOutput);
+      .map((m) => normalizeSpecOutput(m.spec_output))
+      .filter((spec): spec is SpecOutput => Boolean(spec));
   }, [messages]);
 
   const activeSpec: SpecOutput | null = useMemo(() => {
@@ -316,26 +452,95 @@ export default function RunDetail() {
       return assistantSpecs[selectedSpecIndex] ?? null;
     }
     if (assistantSpecs.length) return assistantSpecs[assistantSpecs.length - 1];
-    return run?.spec_output ?? null;
+    return normalizeSpecOutput(run?.spec_output);
   }, [assistantSpecs, selectedSpecIndex, run?.spec_output]);
 
+  const specText = useMemo(() => formatSpecText(activeSpec), [activeSpec]);
   const copyToClipboard = async (text: string, label: string) => {
-    await navigator.clipboard.writeText(text);
-    toast({ title: "Copied!", description: `${label} copied to clipboard.` });
+    if (!text) {
+      toast({
+        title: "Nothing to copy",
+        description: `No ${label} is available yet.`,
+        variant: "destructive",
+      });
+      return;
+    }
+    try {
+      if (navigator.clipboard?.writeText && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "absolute";
+        area.style.left = "-9999px";
+        document.body.appendChild(area);
+        area.select();
+        const copied = document.execCommand("copy");
+        document.body.removeChild(area);
+        if (!copied) throw new Error("Clipboard write failed.");
+      }
+      if (label === "JSON") {
+        toast({ title: "Copied JSON to clipboard" });
+      } else {
+        toast({ title: "Copied to clipboard", description: `${label} copied.` });
+      }
+    } catch {
+      toast({
+        title: "Copy failed",
+        description: "Clipboard access was blocked. Check browser permissions and try again.",
+        variant: "destructive",
+      });
+    }
   };
 
-  const downloadJson = () => {
-    if (!activeSpec) return;
-    const blob = new Blob([JSON.stringify(activeSpec, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${(feedbackTitle || "spec").replace(/\s+/g, "_")}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const copyJsonToClipboard = async () => {
+    if (!activeSpec) {
+      toast({
+        title: "Nothing to copy",
+        description: "No valid generated JSON output is available yet.",
+        variant: "destructive",
+      });
+      return;
+    }
+    try {
+      const normalized = stableSortJson(activeSpec);
+      const prettyJson = stringifyPrettyJson(normalized, "spec output");
+      await copyToClipboard(prettyJson, "JSON");
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.stack || error.message : String(error);
+      setErrorDialog({
+        open: true,
+        title: "Copy JSON failed",
+        explanation: "SpecMe could not copy the JSON output.",
+        reason: "The generated output could not be copied because its JSON is invalid.",
+        nextSteps: "Regenerate the output and try Copy JSON again.",
+        technicalDetails: details,
+      });
+    }
   };
+
+  const openActionErrorDialog = useCallback(
+    (
+      title: string,
+      explanation: string,
+      rawResponse: string,
+      fallbackReason: string,
+      fallbackNextSteps: string
+    ) => {
+      const parsed = parseApiErrorText(rawResponse);
+      const ui = buildUiError(parsed, fallbackReason, fallbackNextSteps);
+      setErrorDialog({
+        open: true,
+        title,
+        explanation,
+        reason: ui.reason,
+        nextSteps: ui.nextSteps,
+        technicalDetails: ui.technicalDetails || rawResponse,
+      });
+    },
+    []
+  );
 
   const statusClass = (s: string) => {
     if (s === "done") return "status-done";
@@ -352,6 +557,167 @@ export default function RunDetail() {
   }, [activeSpec?.files_to_modify]);
 
   const activeFile = files[activeIndex];
+  const isGithubFlow = useMemo(() => {
+    if (projectInfo?.mode === "github") return true;
+    if (projectInfo?.mode === "local") return false;
+    return Boolean(repoUrl && !repoUrl.startsWith("local:"));
+  }, [projectInfo?.mode, repoUrl]);
+
+  const saveViaDirectoryPicker = useCallback(async (filesToWrite: SpecFile[]) => {
+    const picker = (
+      window as typeof window & {
+        showDirectoryPicker?: () => Promise<LocalDirectoryHandle>;
+      }
+    ).showDirectoryPicker;
+
+    if (!picker || !window.isSecureContext) return false;
+
+    const directory = await picker();
+    let written = 0;
+
+    for (const file of filesToWrite) {
+      const normalized = toPosix(file.fileName).replace(/^\/+/, "");
+      if (!normalized) continue;
+
+      const parts = normalized.split("/").filter(Boolean);
+      if (!parts.length) continue;
+
+      let current = directory;
+      for (const part of parts.slice(0, -1)) {
+        current = await current.getDirectoryHandle(part, { create: true });
+      }
+
+      const fileHandle = await current.getFileHandle(parts[parts.length - 1], {
+        create: true,
+      });
+      const writable = await fileHandle.createWritable();
+      await writable.write(String(file.fullCode ?? ""));
+      await writable.close();
+      written++;
+    }
+
+    return true;
+  }, []);
+
+  const writeFilesToSelectedFolder = useCallback(
+    async (
+      filesToWrite: SpecFile[],
+      options: { successTitle: string; emptyTitle: string; failureTitle: string }
+    ) => {
+      if (!filesToWrite.length) {
+        toast({
+          title: options.emptyTitle,
+          description: "Generate a plan with file changes first.",
+          variant: "destructive",
+        });
+        return false;
+      }
+
+      try {
+        try {
+          const savedWithPicker = await saveViaDirectoryPicker(filesToWrite);
+          if (savedWithPicker) {
+            toast({
+              title: options.successTitle,
+              description: `Saved ${filesToWrite.length} file(s) to selected folder.`,
+            });
+            return true;
+          }
+        } catch (pickerError) {
+          if (
+            pickerError &&
+            typeof pickerError === "object" &&
+            "name" in pickerError &&
+            (pickerError as { name?: string }).name === "AbortError"
+          ) {
+            return false;
+          }
+        }
+
+        const remembered = await loadRememberedLocalDestination();
+        const defaultPath =
+          remembered && remembered.destinationPath && remembered.exists
+            ? remembered.destinationPath
+            : rememberedLocalDestination;
+        if (remembered && remembered.destinationPath && !remembered.exists) {
+          toast({
+            title: "Choose a new destination folder",
+            description:
+              remembered.missingReason ||
+              "Your previously used destination folder no longer exists.",
+            variant: "destructive",
+          });
+        }
+
+        const destinationPath = window.prompt(
+          "Enter destination folder path for writing changed files (example: /Users/you/Desktop/specme-output):",
+          defaultPath || ""
+        );
+        if (!destinationPath?.trim()) return false;
+
+        const res = await apiFetch("/api/save-local-changes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            destinationPath: destinationPath.trim(),
+            files: filesToWrite.map((f) => ({
+              fileName: f.fileName,
+              fullCode: f.fullCode,
+            })),
+          }),
+        });
+
+        const raw = await res.text();
+        if (!res.ok) {
+          const parsed = parseApiErrorText(raw);
+          const detail = buildUiError(
+            parsed,
+            "Failed to save changes locally.",
+            "Choose a writable folder path and retry."
+          );
+          if (shouldUseErrorDialog(parsed.reason, detail.reason)) {
+            setErrorDialog({
+              open: true,
+              title: options.failureTitle,
+              explanation: "SpecMe could not write files to the selected destination folder.",
+              reason: detail.reason,
+              nextSteps: detail.nextSteps,
+              technicalDetails: detail.technicalDetails || raw,
+            });
+            return false;
+          }
+          throw new Error(detail.reason);
+        }
+
+        let description = "Saved changes locally.";
+        let nextRememberedPath = destinationPath.trim();
+        try {
+          const parsed = JSON.parse(raw) as { message?: string; rememberedDestinationPath?: string };
+          description = parsed.message || description;
+          nextRememberedPath = (parsed.rememberedDestinationPath || nextRememberedPath).trim();
+        } catch {
+          // Keep fallback message.
+        }
+
+        setRememberedLocalDestination(nextRememberedPath);
+
+        toast({
+          title: options.successTitle,
+          description,
+        });
+        return true;
+      } catch (err: unknown) {
+        toast({
+          title: options.failureTitle,
+          description:
+            err instanceof Error ? err.message : "Failed to save changes locally.",
+          variant: "destructive",
+        });
+        return false;
+      }
+    },
+    [loadRememberedLocalDestination, rememberedLocalDestination, saveViaDirectoryPicker, toast]
+  );
 
   useEffect(() => {
     if (activeIndex >= files.length) setActiveIndex(0);
@@ -376,10 +742,9 @@ export default function RunDetail() {
 
     setApplying(true);
     try {
-      const apiBase = getApiBase();
       let attemptId = currentAttemptId;
       if (!attemptId) {
-        const startRes = await fetch(`${apiBase}/api/attempt/start`, {
+        const startRes = await apiFetch("/api/attempt/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });
@@ -397,7 +762,7 @@ export default function RunDetail() {
         setCurrentAttemptId(attemptId);
       }
 
-      const res = await fetch(`${apiBase}/api/save`, {
+      const res = await apiFetch("/api/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -412,13 +777,7 @@ export default function RunDetail() {
         throw new Error(text || "Failed to apply changes");
       }
 
-      toast({
-        title: "Applied",
-        description:
-          projectInfo?.mode === "github"
-            ? `Saved ${file.fileName} in your GitHub working copy.`
-            : `Saved ${file.fileName} to your local project.`,
-      });
+      toast({ title: "Applied", description: `Saved ${file.fileName} to your project.` });
       setHasUndoableChanges(true);
     } catch (err: unknown) {
       toast({
@@ -436,10 +795,9 @@ export default function RunDetail() {
     if (!files.length) return;
     setApplying(true);
     try {
-      const apiBase = getApiBase();
       let attemptId = currentAttemptId;
       if (!attemptId) {
-        const startRes = await fetch(`${apiBase}/api/attempt/start`, {
+        const startRes = await apiFetch("/api/attempt/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });
@@ -460,7 +818,7 @@ export default function RunDetail() {
       for (const f of files) {
         if (isBlocked(f.fileName)) continue;
 
-        const res = await fetch(`${apiBase}/api/save`, {
+        const res = await apiFetch("/api/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -497,8 +855,7 @@ export default function RunDetail() {
     if (!hasUndoableChanges) return;
     setUndoing(true);
     try {
-      const apiBase = getApiBase();
-      const res = await fetch(`${apiBase}/api/attempt/undo`, {
+      const res = await apiFetch("/api/attempt/undo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ attemptId: currentAttemptId }),
@@ -585,12 +942,14 @@ export default function RunDetail() {
     if (projectInfo?.mode !== "github") return;
     setPushing(true);
     try {
-      const apiBase = getApiBase();
-      const res = await fetch(`${apiBase}/api/push`, {
+      const res = await apiFetch("/api/push", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: `SpecMe updates for ${feedbackTitle || "run"}`,
+          files: files
+            .filter((f) => !isBlocked(f.fileName))
+            .map((f) => ({ fileName: f.fileName, fullCode: f.fullCode })),
         }),
       });
 
@@ -601,20 +960,31 @@ export default function RunDetail() {
           success?: boolean;
           message?: string;
           error?: string;
-          changesKeptLocally?: boolean;
+          reasonMessage?: string;
+          nextSteps?: string;
+          exactReason?: string;
         };
         if (!res.ok) {
-          throw new Error(
-            parsed.error ||
-              "Push failed. Generated changes are still kept locally."
+          openActionErrorDialog(
+            "Push to GitHub failed",
+            "SpecMe could not push your commit to the remote repository.",
+            raw,
+            "Push failed.",
+            "Check GitHub access, token permissions, branch rules, and repository ownership."
           );
+          return;
         }
         msg = parsed.message || "Committed and pushed.";
       } catch (parseErr) {
         if (!res.ok) {
-          throw parseErr instanceof Error
-            ? parseErr
-            : new Error("Push failed. Generated changes are still kept locally.");
+          openActionErrorDialog(
+            "Push to GitHub failed",
+            "SpecMe could not push your commit to the remote repository.",
+            parseErr instanceof Error ? parseErr.message : raw,
+            "Push failed. Generated changes are still kept locally.",
+            "Check GitHub access, token permissions, branch rules, and repository ownership."
+          );
+          return;
         }
       }
 
@@ -623,13 +993,17 @@ export default function RunDetail() {
         description: msg,
       });
     } catch (err: unknown) {
-      toast({
-        title: "Push failed",
-        description:
+      setErrorDialog({
+        open: true,
+        title: "Push to GitHub failed",
+        explanation: "SpecMe could not push your commit to the remote repository.",
+        reason:
           err instanceof Error
             ? err.message
             : "Push failed. Generated changes are still kept locally.",
-        variant: "destructive",
+        nextSteps:
+          "Check your network and GitHub credentials, then retry the push.",
+        technicalDetails: err instanceof Error ? err.stack || err.message : String(err),
       });
     } finally {
       setPushing(false);
@@ -637,70 +1011,12 @@ export default function RunDetail() {
   };
 
   const saveChangesLocally = async () => {
-    if (!files.length) {
-      toast({
-        title: "No files to save",
-        description: "Generate a plan with file changes first.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    const destinationPath = window.prompt(
-      "Enter destination folder path for saving changed files:",
-      ""
-    );
-    if (!destinationPath?.trim()) return;
-
     setSavingLocal(true);
     try {
-      const apiBase = getApiBase();
-      const res = await fetch(`${apiBase}/api/save-local-changes`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          destinationPath: destinationPath.trim(),
-          files: files.map((f) => ({
-            fileName: f.fileName,
-            fullCode: f.fullCode,
-          })),
-        }),
-      });
-
-      const raw = await res.text();
-      if (!res.ok) {
-        try {
-          const parsed = JSON.parse(raw) as {
-            error?: string;
-            reconnectManualHint?: string;
-          };
-          const detail = [parsed.error, parsed.reconnectManualHint]
-            .filter(Boolean)
-            .join(" ");
-          throw new Error(detail || "Failed to save changes locally");
-        } catch {
-          throw new Error(raw || "Failed to save changes locally");
-        }
-      }
-
-      let description = "Saved changes locally.";
-      try {
-        const parsed = JSON.parse(raw) as { message?: string };
-        description = parsed.message || description;
-      } catch {
-        // Keep fallback message.
-      }
-
-      toast({
-        title: "Saved locally",
-        description,
-      });
-    } catch (err: unknown) {
-      toast({
-        title: "Local save failed",
-        description:
-          err instanceof Error ? err.message : "Failed to save changes locally.",
-        variant: "destructive",
+      await writeFilesToSelectedFolder(files, {
+        successTitle: "Saved locally",
+        emptyTitle: "No files to save",
+        failureTitle: "Local save failed",
       });
     } finally {
       setSavingLocal(false);
@@ -732,6 +1048,7 @@ export default function RunDetail() {
     if (!text) return;
 
     setSending(true);
+    let openedDialog = false;
     try {
       // 1) insert user message
       const { data: userMsg, error: userInsertErr } = await sbUnsafe
@@ -752,8 +1069,7 @@ export default function RunDetail() {
       setDraft("");
 
       // 2) call AI server
-      const apiBase = getApiBase();
-      const response = await fetch(`${apiBase}/api/analyze`, {
+      const response = await apiFetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -766,13 +1082,23 @@ export default function RunDetail() {
       });
 
       const raw = await response.text();
-      if (!response.ok) throw new Error(raw || "AI server error");
+      if (!response.ok) {
+        openActionErrorDialog(
+          "Generation failed",
+          "SpecMe could not generate the updated plan for this request.",
+          raw || "AI server error",
+          "Generation request failed.",
+          "Retry in a moment. If it keeps failing, verify Gemini API limits and model settings."
+        );
+        openedDialog = true;
+        throw new Error(raw || "AI server error");
+      }
 
-      const parsed = JSON.parse(raw) as {
+      const parsed = parseJsonText<{
         success: boolean;
         data?: SpecOutput;
         error?: string;
-      };
+      }>(raw, "analyze API response");
       if (!parsed.success || !parsed.data) {
         throw new Error(parsed.error || "AI response missing expected fields.");
       }
@@ -812,12 +1138,14 @@ export default function RunDetail() {
       // refresh run (keeps status/error aligned)
       loadRun();
     } catch (err: unknown) {
-      toast({
-        title: "Send failed",
-        description:
-          err instanceof Error ? err.message : "Something went wrong",
-        variant: "destructive",
-      });
+      if (!openedDialog) {
+        toast({
+          title: "Send failed",
+          description:
+            err instanceof Error ? err.message : "Something went wrong",
+          variant: "destructive",
+        });
+      }
     } finally {
       setSending(false);
     }
@@ -884,12 +1212,7 @@ export default function RunDetail() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() =>
-                  copyToClipboard(
-                    JSON.stringify(activeSpec ?? {}, null, 2),
-                    "Spec"
-                  )
-                }
+                onClick={() => copyToClipboard(specText, "Spec")}
                 disabled={!activeSpec}
               >
                 <Copy className="mr-1.5 h-3.5 w-3.5" />
@@ -899,11 +1222,11 @@ export default function RunDetail() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={downloadJson}
+                onClick={copyJsonToClipboard}
                 disabled={!activeSpec}
               >
-                <Download className="mr-1.5 h-3.5 w-3.5" />
-                Download .json
+                <Copy className="mr-1.5 h-3.5 w-3.5" />
+                Copy JSON
               </Button>
 
               <Button
@@ -932,7 +1255,7 @@ export default function RunDetail() {
                 Undo Changes
               </Button>
 
-              {projectInfo?.mode === "github" && (
+              {projectInfo?.mode === "github" && projectInfo?.connectionStatus === "connected" && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -948,7 +1271,7 @@ export default function RunDetail() {
                 </Button>
               )}
 
-              {projectInfo?.mode === "github" && (
+              {projectInfo?.mode === "github" && projectInfo?.connectionStatus === "connected" && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -960,12 +1283,27 @@ export default function RunDetail() {
                   ) : (
                     <GitBranchPlus className="mr-1.5 h-3.5 w-3.5" />
                   )}
-                  Commit & Push
+                  Commit & Push to GitHub
                 </Button>
               )}
             </div>
           )}
         </div>
+
+        {/* Connection status warning */}
+        {projectInfo?.connectionStatus === "failed" && (
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm mb-6">
+            <div className="text-red-200 font-medium">Project connection failed</div>
+            {projectInfo.lastConnectionError && (
+              <div className="text-red-300/80 text-xs mt-1">{projectInfo.lastConnectionError}</div>
+            )}
+            <div className="mt-2">
+              <Link to="/sync" className="text-xs text-primary underline underline-offset-2">
+                Reconnect from Sync
+              </Link>
+            </div>
+          </div>
+        )}
 
         {/* ✅ Conversation + History (memory) */}
         <div className="glass-card p-5 mb-6">
@@ -1297,6 +1635,10 @@ export default function RunDetail() {
           </div>
         )}
       </div>
+      <ErrorDialog
+        state={errorDialog}
+        onOpenChange={(open) => setErrorDialog((prev) => ({ ...prev, open }))}
+      />
     </AppLayout>
   );
 }

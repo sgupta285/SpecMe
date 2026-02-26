@@ -10,9 +10,12 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { Loader2, ArrowLeft, Sparkles } from "lucide-react";
+import { apiFetch } from "@/lib/api";
+import ErrorDialog, { type ErrorDialogState } from "@/components/ErrorDialog";
+import { buildUiError, parseApiErrorText, shouldUseErrorDialog } from "@/lib/errors";
+import { parseJsonText } from "@/lib/json";
 
 interface LocationState {
-  useSample?: boolean;
   originRoute?: string;
   originTitle?: string;
   originUiText?: string;
@@ -51,13 +54,7 @@ export default function Upload() {
   const state = location.state as LocationState | null;
 
   const [title, setTitle] = useState("");
-  const [content, setContent] = useState(
-    state?.prefill
-      ? state.prefill
-      : state?.useSample
-      ? "We have no rate limiting for WebSockets. Write a middleware for the Express server to fix this."
-      : ""
-  );
+  const [content, setContent] = useState(state?.prefill ? state.prefill : "");
 
   const [loading, setLoading] = useState(false);
   const [repoUrl, setRepoUrl] = useState<string | null>(null);
@@ -65,6 +62,14 @@ export default function Upload() {
   const [feedbackId, setFeedbackId] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [projectReady, setProjectReady] = useState(false);
+  const [errorDialog, setErrorDialog] = useState<ErrorDialogState>({
+    open: false,
+    title: "",
+    explanation: "",
+    reason: "",
+    nextSteps: "",
+    technicalDetails: "",
+  });
 
   useEffect(() => {
     if (!user) return;
@@ -92,14 +97,31 @@ export default function Upload() {
 
         setRepoUrl(data.repo_url);
 
-        const apiBase = (import.meta.env.VITE_API_URL || "http://localhost:4000").replace(/\/$/, "");
-        const projectRes = await fetch(`${apiBase}/api/project`).catch(() => null);
+        const projectRes = await apiFetch("/api/project").catch(() => null);
         if (!projectRes?.ok) {
-          toast({
-            title: "Project connection error",
-            description: "Could not verify active project state. Reconnect from Sync.",
-            variant: "destructive",
-          });
+          const raw = projectRes ? await projectRes.text() : "Could not verify active project state.";
+          const parsed = parseApiErrorText(raw);
+          const ui = buildUiError(
+            parsed,
+            "Could not verify active project state.",
+            "Reconnect from Sync, then retry."
+          );
+          if (shouldUseErrorDialog(parsed.reason, ui.reason)) {
+            setErrorDialog({
+              open: true,
+              title: "Project connection error",
+              explanation: "SpecMe could not verify your active project source.",
+              reason: ui.reason,
+              nextSteps: ui.nextSteps,
+              technicalDetails: ui.technicalDetails || raw,
+            });
+          } else {
+            toast({
+              title: "Project connection error",
+              description: ui.reason,
+              variant: "destructive",
+            });
+          }
           navigate("/sync");
           return;
         }
@@ -181,6 +203,7 @@ export default function Upload() {
     }
 
     setLoading(true);
+    let openedDialog = false;
 
     // 1) create run row
     const { data: runData, error: runError } = await supabase
@@ -206,12 +229,8 @@ export default function Upload() {
       const runId = runData.id;
 
       try {
-      const apiBase = (
-        import.meta.env.VITE_API_URL || "http://localhost:4000"
-      ).replace(/\/$/, "");
-
       // Record project context used for this run so old runs can auto-reconnect.
-      await fetch(`${apiBase}/api/runs/project`, {
+      await apiFetch("/api/runs/project", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ runId }),
@@ -220,7 +239,7 @@ export default function Upload() {
       });
 
       // 2) call analysis server
-      const response = await fetch(`${apiBase}/api/analyze`, {
+      const response = await apiFetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -233,14 +252,28 @@ export default function Upload() {
       });
 
       const raw = await response.text();
-      if (!response.ok) throw new Error(raw || "Analysis server error");
-
-      let parsed: AnalyzeResponse;
-      try {
-        parsed = JSON.parse(raw) as AnalyzeResponse;
-      } catch {
-        throw new Error("Server returned invalid JSON");
+      if (!response.ok) {
+        const parsed = parseApiErrorText(raw);
+        const ui = buildUiError(
+          parsed,
+          "Generation failed.",
+          "Retry in a moment. If this keeps happening, check Gemini configuration and quota."
+        );
+        if (shouldUseErrorDialog(parsed.reason, ui.reason)) {
+          setErrorDialog({
+            open: true,
+            title: "Plan generation failed",
+            explanation: "SpecMe could not generate this plan from the AI service.",
+            reason: ui.reason,
+            nextSteps: ui.nextSteps,
+            technicalDetails: ui.technicalDetails || raw,
+          });
+          openedDialog = true;
+        }
+        throw new Error(ui.reason || raw || "Analysis server error");
       }
+
+      const parsed = parseJsonText<AnalyzeResponse>(raw, "analyze API response");
 
       if (!parsed.success || !parsed.data) {
         throw new Error(
@@ -273,11 +306,13 @@ export default function Upload() {
         .update({ status: "error", error_message: msg })
         .eq("id", runId);
 
-      toast({
-        title: "Error",
-        description: msg,
-        variant: "destructive",
-      });
+      if (!openedDialog) {
+        toast({
+          title: "Error",
+          description: msg,
+          variant: "destructive",
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -333,6 +368,10 @@ export default function Upload() {
           )}
         </div>
       </div>
+      <ErrorDialog
+        state={errorDialog}
+        onOpenChange={(open) => setErrorDialog((prev) => ({ ...prev, open }))}
+      />
     </AppLayout>
   );
 }

@@ -8,6 +8,9 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { Loader2, ArrowLeft } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
+import { apiFetch } from "@/lib/api";
+import ErrorDialog, { type ErrorDialogState } from "@/components/ErrorDialog";
+import { buildUiError, parseApiErrorText } from "@/lib/errors";
 
 type ProjectMode = "github" | "local";
 type SyncErrorState = {
@@ -16,12 +19,6 @@ type SyncErrorState = {
   availableBranches?: string[];
 };
 
-function getApiBase() {
-  const raw = (import.meta.env.VITE_API_URL ?? "").toString().trim();
-  if (!raw) return "";
-  return raw.replace(/\/$/, "");
-}
-
 function parseStoredProject(repoUrl: string | null, repoBranch: string | null) {
   const raw = (repoUrl ?? "").trim();
   if (raw.startsWith("local:")) {
@@ -29,7 +26,7 @@ function parseStoredProject(repoUrl: string | null, repoBranch: string | null) {
       mode: "local" as ProjectMode,
       localPath: raw.slice("local:".length),
       githubUrl: "",
-      branch: repoBranch?.trim() || "main",
+      branch: repoBranch?.trim() || "",
     };
   }
 
@@ -37,7 +34,7 @@ function parseStoredProject(repoUrl: string | null, repoBranch: string | null) {
     mode: "github" as ProjectMode,
     localPath: "",
     githubUrl: raw,
-    branch: repoBranch?.trim() || "main",
+    branch: repoBranch?.trim() || "",
   };
 }
 
@@ -49,12 +46,20 @@ export default function Sync() {
 
   const [mode, setMode] = useState<ProjectMode>("github");
   const [repoUrl, setRepoUrlState] = useState("");
-  const [repoBranch, setRepoBranchState] = useState("main");
+  const [repoBranch, setRepoBranchState] = useState("");
   const [localPath, setLocalPath] = useState("");
   const [loading, setLoading] = useState(false);
   const [syncError, setSyncError] = useState<SyncErrorState | null>(null);
   const [selectedFallbackBranch, setSelectedFallbackBranch] = useState("");
   const [manualBranch, setManualBranch] = useState("");
+  const [errorDialog, setErrorDialog] = useState<ErrorDialogState>({
+    open: false,
+    title: "",
+    explanation: "",
+    reason: "",
+    nextSteps: "",
+    technicalDetails: "",
+  });
 
   useEffect(() => {
     if (!user) return;
@@ -88,15 +93,16 @@ export default function Sync() {
     return repoUrl || null;
   }, [mode, localPath, repoUrl]);
 
+  const suggestedBranches = useMemo(() => {
+    const branches = syncError?.availableBranches || [];
+    return Array.from(new Set(branches.map((b) => b.trim()).filter((b) => b && !b.startsWith("spec-me/"))));
+  }, [syncError?.availableBranches]);
+
   const handleSave = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!user) return;
 
-    const cleanUrl = repoUrl.trim();
-    const cleanBranch = repoBranch.trim();
-    const cleanLocalPath = localPath.trim();
-
-    if (mode === "github" && !cleanUrl) {
+    if (mode === "github" && !repoUrl.trim()) {
       toast({
         title: "Error",
         description: "Repository URL is required.",
@@ -105,7 +111,7 @@ export default function Sync() {
       return;
     }
 
-    if (mode === "local" && !cleanLocalPath) {
+    if (mode === "local" && !localPath.trim()) {
       toast({
         title: "Error",
         description: "Local project folder path is required.",
@@ -114,18 +120,25 @@ export default function Sync() {
       return;
     }
 
+    await retrySyncWithBranch();
+  };
+
+  const retrySyncWithBranch = async (branchOverride?: string) => {
+    if (!user) return;
+    const cleanUrl = repoUrl.trim();
+    const cleanLocalPath = localPath.trim();
+    const effectiveBranch = branchOverride?.trim() || repoBranch.trim();
+
     setLoading(true);
     setSyncError(null);
 
     try {
-      const apiBase = getApiBase();
-      const syncUrl = `${apiBase}/api/sync`;
-      const res = await fetch(syncUrl, {
+      const res = await apiFetch("/api/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(
           mode === "github"
-            ? { mode: "github", repoUrl: cleanUrl, repoBranch: cleanBranch }
+            ? { mode: "github", repoUrl: cleanUrl, repoBranch: effectiveBranch }
             : { mode: "local", localPath: cleanLocalPath }
         ),
       });
@@ -135,10 +148,11 @@ export default function Sync() {
         let parsed: {
           error?: string;
           reason?: string;
-          reconnectAction?: string;
-          retryable?: boolean;
           availableBranches?: string[];
-          reconnectManualHint?: string;
+          reasonMessage?: string;
+          exactReason?: string;
+          nextSteps?: string;
+          technicalDetails?: string;
         } | null = null;
         try {
           parsed = JSON.parse(raw) as typeof parsed;
@@ -147,18 +161,30 @@ export default function Sync() {
         }
 
         const branches = Array.isArray(parsed?.availableBranches) ? parsed.availableBranches : [];
-        const detail = [parsed?.error, parsed?.reconnectManualHint]
-          .filter(Boolean)
-          .join(" ");
-        const message = detail || raw || "Sync failed";
         setSyncError({
-          message,
+          message: parsed?.error || raw || "Sync failed",
           reason: parsed?.reason,
           availableBranches: branches,
         });
-        if (parsed?.reason === "branch_selection_required" && branches.length > 0) {
-          setSelectedFallbackBranch((prev) => prev || branches[0]);
+        if (branches.length > 0) {
+          const firstNonSafety = branches.find((b) => !b.startsWith("spec-me/"));
+          setSelectedFallbackBranch((prev) => prev || firstNonSafety || branches[0]);
+        } else {
+          setSelectedFallbackBranch("");
         }
+        const ui = buildUiError(
+          parsed || parseApiErrorText(raw),
+          "Project sync failed.",
+          "Reconnect GitHub/local project and verify access before retrying."
+        );
+        setErrorDialog({
+          open: true,
+          title: "Project sync failed",
+          explanation: "SpecMe could not connect to the selected project source.",
+          reason: ui.reason,
+          nextSteps: ui.nextSteps,
+          technicalDetails: ui.technicalDetails || raw,
+        });
         return;
       }
 
@@ -171,7 +197,7 @@ export default function Sync() {
       }
 
       const repoUrlForStorage = mode === "local" ? `local:${cleanLocalPath}` : cleanUrl;
-      const branchForStorage = mode === "github" ? (syncedBranch || cleanBranch || "main") : null;
+      const branchForStorage = mode === "github" ? (syncedBranch || effectiveBranch || "main") : null;
       const { error: upsertErr } = await supabase.from("user_settings").upsert(
         {
           user_id: user.id,
@@ -183,28 +209,43 @@ export default function Sync() {
       );
       if (upsertErr) throw upsertErr;
 
+      // Update local state to match what was actually synced
+      if (syncedBranch) setRepoBranchState(syncedBranch);
+
       toast({ title: "Project linked", description: "Saved and indexed successfully." });
       navigate("/dashboard");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Something went wrong";
-      toast({ title: "Error", description: msg, variant: "destructive" });
+      setErrorDialog({
+        open: true,
+        title: "Project sync failed",
+        explanation: "SpecMe could not reach or authenticate with the selected project source.",
+        reason: msg,
+        nextSteps: "Check network access and credentials, then retry sync.",
+        technicalDetails: err instanceof Error ? err.stack || err.message : String(err),
+      });
     } finally {
       setLoading(false);
     }
   };
 
   const retrySync = async () => {
-    const fake = {
-      preventDefault: () => undefined,
-    } as unknown as React.FormEvent<HTMLFormElement>;
-    await handleSave(fake);
+    await retrySyncWithBranch();
   };
 
   const applyFallbackBranchAndRetry = async () => {
     const chosen = manualBranch.trim() || selectedFallbackBranch.trim();
-    if (!chosen) return;
+    if (!chosen) {
+      toast({
+        title: "Branch required",
+        description: "Type a branch name or select an existing branch and retry.",
+        variant: "destructive",
+      });
+      return;
+    }
     setRepoBranchState(chosen);
-    await retrySync();
+    // Pass the branch directly to avoid React state race condition
+    await retrySyncWithBranch(chosen);
   };
 
   return (
@@ -295,26 +336,37 @@ export default function Sync() {
 
             {syncError && (
               <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm">
-                <div className="text-red-200">{syncError.message}</div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <Button type="button" variant="outline" onClick={() => void retrySync()} disabled={loading}>
-                    Retry Sync
-                  </Button>
-                  <Button type="button" variant="outline" onClick={() => navigate("/sync")}>
-                    Reconnect Manually
-                  </Button>
-                </div>
-                {syncError.reason === "branch_selection_required" ? (
+                <div className="text-red-200 font-medium">GitHub sync failed</div>
+                <div className="text-red-200 mt-1">{syncError.message}</div>
+
+                {syncError.reason === "head_invalid" ? (
                   <div className="mt-3 space-y-2">
-                    <Label htmlFor="fallback_branch">Select branch manually</Label>
-                    {(syncError.availableBranches?.length ?? 0) > 0 ? (
+                    <div className="text-xs text-red-300/80">
+                      The repository may be empty or in an invalid state. Try selecting a branch manually, or verify the repository has at least one commit.
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button type="button" variant="outline" onClick={() => void retrySync()} disabled={loading}>
+                        Retry Sync
+                      </Button>
+                      <Button type="button" variant="outline" onClick={() => navigate("/sync")}>
+                        Reconnect
+                      </Button>
+                    </div>
+                  </div>
+                ) : syncError.reason === "branch_selection_required" || syncError.reason === "branch_missing" ? (
+                  <div className="mt-3 space-y-2">
+                    <div className="text-xs text-red-300/80">
+                      Type a branch name or select an existing branch and retry.
+                    </div>
+                    <Label htmlFor="fallback_branch">Select branch</Label>
+                    {suggestedBranches.length > 0 ? (
                       <select
                         id="fallback_branch"
                         value={selectedFallbackBranch}
                         onChange={(e) => setSelectedFallbackBranch(e.target.value)}
                         className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
                       >
-                        {(syncError.availableBranches || []).map((b) => (
+                        {suggestedBranches.map((b) => (
                           <option key={b} value={b}>
                             {b}
                           </option>
@@ -325,19 +377,57 @@ export default function Sync() {
                       id="manual_branch"
                       value={manualBranch}
                       onChange={(e) => setManualBranch(e.target.value)}
-                      placeholder="or type branch name (e.g. main)"
+                      placeholder="Type branch name (e.g. main, master, dev, feature/x)"
+                      list="remote-branch-suggestions"
                       className="font-mono text-sm"
                     />
-                    <Button type="button" variant="outline" onClick={() => void applyFallbackBranchAndRetry()} disabled={loading}>
-                      Select Branch Manually
+                    {suggestedBranches.length > 0 ? (
+                      <datalist id="remote-branch-suggestions">
+                        {suggestedBranches.map((b) => (
+                          <option key={`suggestion-${b}`} value={b} />
+                        ))}
+                      </datalist>
+                    ) : null}
+                    {suggestedBranches.length > 0 ? (
+                      <div className="text-xs text-red-300/80">
+                        Available branches: {suggestedBranches.join(", ")}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-red-300/80">
+                        Branch list could not be loaded. You can still type a branch name and retry.
+                      </div>
+                    )}
+                    <div className="flex flex-wrap gap-2">
+                      <Button type="button" variant="outline" onClick={() => void applyFallbackBranchAndRetry()} disabled={loading}>
+                        Select/Type Branch
+                      </Button>
+                      <Button type="button" variant="outline" onClick={() => void retrySync()} disabled={loading}>
+                        Retry Sync
+                      </Button>
+                      <Button type="button" variant="outline" onClick={() => navigate("/sync")}>
+                        Reconnect
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button type="button" variant="outline" onClick={() => void retrySync()} disabled={loading}>
+                      Retry Sync
+                    </Button>
+                    <Button type="button" variant="outline" onClick={() => navigate("/sync")}>
+                      Reconnect
                     </Button>
                   </div>
-                ) : null}
+                )}
               </div>
             )}
           </form>
         </div>
       </div>
+      <ErrorDialog
+        state={errorDialog}
+        onOpenChange={(open) => setErrorDialog((prev) => ({ ...prev, open }))}
+      />
     </AppLayout>
   );
 }

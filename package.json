@@ -5,10 +5,11 @@
   "type": "module",
   "main": "main.cjs",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently --kill-others \"npm run dev:web\" \"npm run server\"",
+    "dev:web": "vite",
     "server": "node server/server.js",
     "electron": "electron .",
-    "start": "concurrently --kill-others \"npm run dev\" \"npm run server\" \"npm run electron\"",
+    "start": "concurrently --kill-others \"npm run dev:web\" \"npm run server\" \"npm run electron\"",
     "build": "vite build",
     "build:dev": "vite build --mode development",
     "lint": "eslint .",
